@@ -1,0 +1,32 @@
+# 金鑰與個人設定；保留空白範本
+.env
+.env.*
+!.env.example
+
+# 安裝器建立的環境與工具
+.venv/
+.python/
+.tools/
+
+# Python 快取
+__pycache__/
+*.pyc
+
+# 本機模型與快取
+models/
+.cache/
+
+# 字幕與執行紀錄
+*.jsonl
+*.log
+*.stop
+*.language.json
+*.pause.json
+*.mode.json
+
+# 開發備份
+*.bak
+
+# 測試音訊、影片及辨識輸出
+test_audio*
+
