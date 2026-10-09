@@ -18,6 +18,7 @@ if os.name == 'nt' and (_library / 'lib/tcl8.6/init.tcl').is_file():
 import tkinter as tk
 from tkinter import ttk
 from usage_meter import UsageStats, UsagePanel, duration
+from process_audio import list_applications, supported as process_capture_supported
 
 
 class TranscriptTail:
@@ -181,7 +182,7 @@ class PillButton(tk.Canvas):
 
 
 class SubtitleWindow:
-    def __init__(self, root, log, stop_file, language_file=None, language="ja", pause_file=None, mode_file=None):
+    def __init__(self, root, log, stop_file, language_file=None, language="ja", pause_file=None, mode_file=None, source_file=None):
         self.root = root
         self.tail = TranscriptTail(log)
         self.stop_file = Path(stop_file)
@@ -189,6 +190,12 @@ class SubtitleWindow:
         self.selected_language = tk.StringVar(value=language)
         self.active_language = language
         self.pause_file = Path(pause_file) if pause_file else None
+        self.source_file = Path(source_file) if source_file else None
+        self.source_mode = tk.StringVar(value='device')
+        self.source_choice = tk.StringVar()
+        self.source_status = tk.StringVar(value='音訊來源：整個輸出裝置')
+        self.source_request_id = None
+        self.applications = []
         self.mode_file = Path(mode_file) if mode_file else None
         self.selected_mode = tk.StringVar(value='sliding')
         self.active_mode = 'sliding'
@@ -318,6 +325,25 @@ class SubtitleWindow:
             for label, code in [('兩段合併', 'paired'), ('逐段滑動', 'sliding')]:
                 PillButton(modes, label, self.request_mode, self.selected_mode, code).pack(side='left', padx=3)
             tk.Label(modes, textvariable=self.mode_status, bg=panel, fg=muted).pack(side='left', padx=10)
+        if self.source_file is not None:
+            sources = tk.Frame(self.settings_panel, bg=panel)
+            sources.pack(fill='x', pady=(6, 0))
+            tk.Label(sources, text='音訊來源', bg=panel, fg=muted).pack(side='left', padx=(0, 8))
+            for label, mode in [('全部輸出', 'device'), ('指定程式', 'process')]:
+                button = PillButton(sources, label, self.update_source_controls, self.source_mode, mode)
+                button.pack(side='left', padx=3)
+                if mode == 'process' and not process_capture_supported():
+                    button.configure(state='disabled')
+            self.application_combo = ttk.Combobox(sources, textvariable=self.source_choice,
+                                                   state='readonly', width=26)
+            self.application_combo.pack(side='left', fill='x', expand=True, padx=6)
+            self.refresh_button = PillButton(sources, '重新整理', self.refresh_applications)
+            self.refresh_button.pack(side='left', padx=3)
+            self.source_button = PillButton(sources, '套用', self.request_source)
+            self.source_button.pack(side='left', padx=3)
+            tk.Label(self.settings_panel, textvariable=self.source_status, bg=panel, fg=muted,
+                     anchor='w', wraplength=620).pack(fill='x', pady=(4, 0))
+            self.update_source_controls()
         self.settings_panel.grid_remove()
 
         footer = self.footer = tk.Frame(root, bg=bg)
@@ -464,7 +490,7 @@ class SubtitleWindow:
                 self.compact.set(False)
                 self.toggle_compact()
             self.settings_panel.grid()
-            self.root.minsize(660, 490)
+            self.root.minsize(760, 580)
         else:
             self.settings_panel.grid_remove()
             self.root.minsize(660, 260 if self.compact.get() else 330)
@@ -545,6 +571,45 @@ class SubtitleWindow:
         else:
             self.original_panel.grid_remove()
             self.root.rowconfigure(2, weight=0)
+
+    def update_source_controls(self):
+        enabled = self.source_mode.get() == 'process' and not self.stopped
+        self.application_combo.configure(state='readonly' if enabled else 'disabled')
+        self.refresh_button.configure(state='normal' if enabled else 'disabled')
+        if enabled and not self.applications:
+            self.refresh_applications()
+
+    def refresh_applications(self):
+        old = self.application_combo.current()
+        previous = self.applications[old] if 0 <= old < len(self.applications) else None
+        try:
+            self.applications = list_applications()
+            self.application_combo.configure(values=[f"{r['name']} · {r['pid']} · {r['title']}" for r in self.applications])
+            index = next((i for i,r in enumerate(self.applications) if previous and
+                          (r['pid'],r['created']) == (previous['pid'],previous['created'])), 0)
+            if self.applications: self.application_combo.current(index)
+            else: self.source_choice.set('沒有可選程式，請先開啟瀏覽器')
+        except OSError as exc:
+            self.source_status.set(f'無法取得程式清單：{exc}')
+
+    def request_source(self):
+        if self.stopped or self.source_file is None:
+            return
+        request = {'mode': self.source_mode.get(), 'request_id': str(time.time_ns())}
+        if request['mode'] == 'process':
+            index = self.application_combo.current()
+            if index < 0 or index >= len(self.applications):
+                self.source_status.set('請先選擇程式。')
+                return
+            request.update(self.applications[index])
+        try:
+            temporary = self.source_file.with_suffix('.tmp')
+            temporary.write_text(json.dumps(request, ensure_ascii=False), encoding='utf-8')
+            temporary.replace(self.source_file)
+            self.source_request_id = request['request_id']
+            self.source_status.set('正在切換音訊來源…')
+        except OSError as exc:
+            self.source_status.set(f'音訊來源切換失敗：{exc}')
 
     def request_mode(self):
         if self.stopped or self.mode_file is None:
@@ -691,6 +756,12 @@ class SubtitleWindow:
                     self.elapsed_anchor = time.monotonic()
                 if row.get('event') == 'api_usage':
                     self.usage.accept(row)
+                elif row.get('event') in ('source_changed', 'source_error'):
+                    if self.source_request_id is None or row.get('request_id') == self.source_request_id:
+                        if row['event'] == 'source_changed':
+                            self.source_status.set('擷取中：' + row['name'])
+                        else:
+                            self.source_status.set('未收音：' + row['error'])
                 elif row.get('event') == 'mode_changed':
                     self.active_mode = row['mode']
                     label = '兩段合併' if self.active_mode == 'paired' else '逐段滑動'
@@ -712,6 +783,8 @@ class SubtitleWindow:
                     self.stage.set('已停止')
                     self.stop_button.configure(state='disabled')
                     self.pause_button.configure(state='disabled')
+                    if self.source_file is not None:
+                        self.source_button.configure(state='disabled')
                     stopped_text = '已停止 · 可回看歷史字幕' if row.get('delete_event_log') else '已停止 · 字幕已存檔'
                     self.status.set(stopped_text if not row.get('error') else '已停止 · ' + row['error'])
                     if row.get('delete_event_log'):
@@ -744,10 +817,11 @@ if __name__ == '__main__':
     parser.add_argument('--title', default='直播字幕 · SenseVoice')
     parser.add_argument('--pause-file')
     parser.add_argument('--mode-file')
+    parser.add_argument('--source-file')
     parser.add_argument('--language-file')
     parser.add_argument('--language', choices=['en', 'ja'], default='ja')
     args = parser.parse_args()
     root = tk.Tk()
-    app = SubtitleWindow(root, args.log, args.stop_file, args.language_file, args.language, args.pause_file, args.mode_file)
+    app = SubtitleWindow(root, args.log, args.stop_file, args.language_file, args.language, args.pause_file, args.mode_file, args.source_file)
     root.title(args.title)
     root.mainloop()

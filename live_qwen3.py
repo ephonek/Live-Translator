@@ -19,9 +19,9 @@ load_dotenv(
 )
 
 import numpy as np
-import pyaudiowpatch as pyaudio
 import torch
 from qwen_backend import QwenASR, ASRLengthLimitError
+from audio_source import AudioSource
 from two_pass_translation import translate_windows
 from faster_whisper.vad import get_speech_timestamps
 from openai import OpenAI
@@ -59,6 +59,7 @@ PAUSE_FILE = OUTPUT.with_suffix(".pause.json")
 capture_paused = False
 MODE_FILE = OUTPUT.with_suffix(".mode.json")
 translation_mode = "sliding"
+SOURCE_FILE = OUTPUT.with_suffix(".source.json")
 
 
 class Translation(BaseModel):
@@ -99,7 +100,6 @@ zh_tw：
 """
 
 # 錄音與辨識翻譯各有自己的佇列。
-capture_queue = queue.Queue(maxsize=100)
 jobs = queue.Queue(maxsize=8)
 translation_jobs = queue.Queue(maxsize=8)
 log_lock = threading.Lock()
@@ -327,25 +327,6 @@ def worker():
         failed.set()
 
 
-def audio_callback(data, frame_count, time_info, status):
-    if recording_stopped.is_set() or failed.is_set():
-        return (None, pyaudio.paComplete)
-
-    if status:
-        errors.put(f"錄音串流狀態異常：{status}；停止以免時間軸錯位。")
-        failed.set()
-        return (None, pyaudio.paAbort)
-
-    try:
-        capture_queue.put_nowait((data, time.perf_counter()))
-    except queue.Full:
-        errors.put("音訊擷取佇列已滿，停止以免漏錄。")
-        failed.set()
-        return (None, pyaudio.paAbort)
-
-    return (None, pyaudio.paContinue)
-
-
 # 以下時間位置都以 16 kHz 的樣本數計算。
 buffer = np.empty(0, dtype=np.float32)
 buffer_start = 0
@@ -485,6 +466,7 @@ publish("session_started", {"elapsed_seconds": time.monotonic() - SESSION_STARTE
 LANGUAGE_FILE.write_text(json.dumps({"language": LANGUAGE}), encoding="utf-8")
 PAUSE_FILE.write_text(json.dumps({"paused": False}), encoding="utf-8")
 MODE_FILE.write_text(json.dumps({"mode": translation_mode}), encoding="utf-8")
+SOURCE_FILE.write_text(json.dumps({"mode": "device", "request_id": "initial"}), encoding="utf-8")
 subtitle_process = None
 if "--no-window" not in sys.argv:
     try:
@@ -493,7 +475,7 @@ if "--no-window" not in sys.argv:
              "--log", str(EVENT_OUTPUT), "--stop-file", str(STOP_FILE),
              "--title", "直播字幕 · Qwen3-ASR-1.7B",
              "--language-file", str(LANGUAGE_FILE), "--language", LANGUAGE,
-             "--pause-file", str(PAUSE_FILE), "--mode-file", str(MODE_FILE)],
+             "--pause-file", str(PAUSE_FILE), "--mode-file", str(MODE_FILE), "--source-file", str(SOURCE_FILE)],
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except OSError as exc:
@@ -503,67 +485,72 @@ session_error = None
 processing_thread = threading.Thread(target=worker)
 processing_thread.start()
 
-try:
-    with pyaudio.PyAudio() as p:
-        device = p.get_default_wasapi_loopback()
-        rate = int(device["defaultSampleRate"])
-        channels = int(device["maxInputChannels"])
-        divisor = math.gcd(rate, SR)
+source = None
+last_source_request = None
 
-        # 常見 44.1 / 48 kHz 裝置每包約 100 ms。
-        # 讓每包轉換後的樣本數為整數，避免時間誤差累積。
-        unit = rate // divisor
-        frames = max(1, round(rate * 0.1 / unit)) * unit
 
-        print(f"擷取：{device['name']}")
-        print(f"語言：{LANGUAGE} / 輸出：{OUTPUT}")
-        print("開始播放影片，Ctrl+C 停止並處理剩餘音訊。", flush=True)
-
-        with p.open(
-            format=pyaudio.paInt16,
-            channels=channels,
-            rate=rate,
-            input=True,
-            input_device_index=int(device["index"]),
-            frames_per_buffer=frames,
-            stream_callback=audio_callback,
-        ) as stream:
-            try:
-                while not failed.is_set() and not STOP_FILE.exists():
-                    check_pause_request()
-                    check_language_request()
-                    try:
-                        data, captured_at = capture_queue.get(timeout=0.2)
-                    except queue.Empty:
-                        if failed.is_set():
-                            break
-                        if not stream.is_active():
-                            raise RuntimeError("錄音串流意外停止。")
-                        continue
-
-                    accept_packet(
-                        data, captured_at, rate, channels, divisor
-                    )
-
-            except KeyboardInterrupt:
-                print("\n停止錄音，處理剩餘音訊……", flush=True)
-            finally:
-                recording_stopped.set()
-                stream.stop_stream()
-
+def finish_source():
+    global source, language_epoch, last_vad
+    if source is not None:
+        source.close()
         if not failed.is_set():
-            # 處理停止前已錄到、但還沒切段的資料。
-            while not capture_queue.empty():
-                data, captured_at = capture_queue.get_nowait()
-                accept_packet(data, captured_at, rate, channels, divisor)
+            divisor = math.gcd(source.rate, SR)
+            for data, captured_at in source.drain():
+                accept_packet(data, captured_at, source.rate, source.channels, divisor)
+            submit('來源結束')
+        source = None
+        language_epoch += 1
+        last_vad = total
 
-            submit("結束")
+
+try:
+    print(f"語言：{LANGUAGE} / 輸出：{OUTPUT}", flush=True)
+    print("可在字幕設定中選擇音訊來源，Ctrl+C 停止。", flush=True)
+    while not failed.is_set() and not STOP_FILE.exists():
+        check_pause_request()
+        check_language_request()
+        try:
+            request = json.loads(SOURCE_FILE.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            request = {}
+        if isinstance(request, dict) and request.get('request_id') and request['request_id'] != last_source_request:
+            last_source_request = request['request_id']
+            finish_source()
+            try:
+                source = AudioSource(request).start()
+                publish('source_changed', {'request_id': last_source_request, 'name': source.name,
+                                          'mode': request['mode']})
+                print(f'擷取：{source.name}', flush=True)
+            except Exception as exc:
+                source = None
+                publish('source_error', {'request_id': last_source_request, 'error': str(exc)})
+                print(f'音訊來源無法啟動：{exc}', flush=True)
+        if source is None:
+            time.sleep(.1)
+            continue
+        try:
+            data, captured_at = source.read()
+        except queue.Empty:
+            continue
+        except Exception as exc:
+            finish_source()
+            publish('source_error', {'request_id': last_source_request, 'error': str(exc)})
+            print(f'音訊來源已停止：{exc}', flush=True)
+            continue
+        accept_packet(data, captured_at, source.rate, source.channels, math.gcd(source.rate, SR))
+except KeyboardInterrupt:
+    print("停止錄音，處理剩餘音訊……", flush=True)
 
 except Exception as exc:
     session_error = str(exc)
     print(f"\n停止擷取：{exc}", flush=True)
 
 finally:
+    try:
+        finish_source()
+    except Exception as exc:
+        session_error = str(exc)
+        print(f'音訊來源收尾失敗：{exc}', flush=True)
     recording_stopped.set()
 
     # 已送出的片段按順序完成後再結束。
@@ -592,5 +579,6 @@ finally:
     LANGUAGE_FILE.unlink(missing_ok=True)
     PAUSE_FILE.unlink(missing_ok=True)
     MODE_FILE.unlink(missing_ok=True)
+    SOURCE_FILE.unlink(missing_ok=True)
 
     cleanup_session_logs()

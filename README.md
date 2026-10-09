@@ -164,3 +164,16 @@ OpenAI API 進行翻譯。使用者應了解相關資料處理方式，
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -CheckOnly
 ```
+
+
+### 指定程式音訊
+
+在「設定 → 音訊來源」選擇「指定程式」，從清單選 Edge、Chrome 或其他有視窗的程式，再按「套用」。
+清單按程序樹分組，瀏覽器同一程序樹中的多個分頁聲音可能一起被擷取；不能分離直播內的背景音樂。
+若程式剛開啟，先按「重新整理」。程式關閉／重新啟動後需重新選擇並套用。
+來源出錯時會停止該來源並顯示提示，不會自動改抓全部聲音。
+可切回「全部輸出」並按「套用」，使用原本的預設輸出裝置擷取。
+
+指定程式功能需要 Windows build 20348 以上（例如 Windows 11）；Windows 10 22H2 不支援，仍可使用全部輸出。
+使用 Windows 內建音訊介面，不需另外安裝虛擬音效卡。
+更新此版本時，請一併取得 `audio_source.py` 與 `process_audio.py`。

@@ -30,3 +30,6 @@ models/
 # 測試音訊、影片及辨識輸出
 test_audio*
 
+
+# Session audio source selection
+*.source.json
