@@ -29,9 +29,10 @@
 目前安裝器限定：
 
 - Windows x64
-- 單張 NVIDIA GeForce RTX 20／30／40 系列顯卡
+- 單張 NVIDIA GeForce RTX 20／30／40／50 系列顯卡
 - 至少 8GB 等級顯存
-- NVIDIA 驅動 560.76 或更新
+- RTX 20／30／40：NVIDIA 驅動 560.76 或更新（PyTorch 2.14.1＋CUDA 12.6）
+- RTX 50：NVIDIA 驅動 580.88 或更新（PyTorch 2.14.1＋CUDA 13.0）
 - 網際網路連線
 - 自己的 OpenAI API key，以及可用的 API 額度
 
@@ -150,3 +151,16 @@ OpenAI API 進行翻譯。使用者應了解相關資料處理方式，
 
 本專案為獨立專案，並非 OpenAI、Qwen 或 YouTube 的官方產品，
 亦不表示獲得上述組織的認可或背書。
+
+### RTX 50 系列安裝
+
+安裝器會自動選擇 `torch==2.14.1+cu130`；20／30／40 系列維持 `cu126`。
+共用 requirements 不綁定 CUDA 後綴，避免將 50 系列換回 cu126。
+更新程式後請重新執行 `install.bat`，讓安裝器切換套件；不需另裝 CUDA Toolkit。
+50 系列尚未完成實機驗證，安裝完成時會檢查套件版本、GPU 運算、SDPA 與模型載入。
+
+只檢查硬體與版本選擇、不安裝任何套件：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -CheckOnly
+```

@@ -1,3 +1,5 @@
+param([switch]$CheckOnly)
+
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 
@@ -8,11 +10,33 @@ function Check-ExitCode([string]$Step) {
     }
 }
 
-try {
-    if (-not (Test-Path -LiteralPath ".env")) {
-    Copy-Item -LiteralPath ".env.example" -Destination ".env"
+function Get-GpuProfile([string]$Name, [version]$Driver, [int]$MemoryMiB) {
+    if ($Name -notmatch 'RTX\s+(20|30|40|50)\d{2}(?:\D|$)') {
+        throw "Supported GPUs: GeForce RTX 20/30/40/50 series. Detected: $Name"
     }
+    $Series = $Matches[1]
+    if ($MemoryMiB -lt 8000) {
+        throw "This release requires an 8GB-class GPU or larger."
+    }
+    $CudaBuild = 'cu126'
+    $CudaVersion = '12.6'
+    $MinimumDriver = [version]'560.76'
+    if ($Series -eq '50') {
+        $CudaBuild = 'cu130'
+        $CudaVersion = '13.0'
+        $MinimumDriver = [version]'580.88'
+    }
+    if ($Driver -lt $MinimumDriver) {
+        throw "RTX $Series series requires driver $MinimumDriver or newer for $CudaBuild. Detected: $Driver"
+    }
+    return [pscustomobject]@{
+        Torch = "2.14.1+$CudaBuild"
+        Cuda = $CudaVersion
+        Index = "https://download.pytorch.org/whl/$CudaBuild"
+    }
+}
 
+try {
     # 1. Check platform.
     if (
         -not [Environment]::Is64BitOperatingSystem -or
@@ -50,16 +74,14 @@ try {
     Write-Host "Driver: $DriverVersion"
     Write-Host "VRAM: $MemoryMiB MiB"
 
-    if ($GpuName -notmatch "RTX\s+(20|30|40)\d{2}") {
-        throw "GPU outside this test release's supported range."
+    $GpuProfile = Get-GpuProfile $GpuName $DriverVersion $MemoryMiB
+    Write-Host "Selected PyTorch: $($GpuProfile.Torch) / CUDA $($GpuProfile.Cuda)"
+    if ($CheckOnly) {
+        Write-Host "Hardware selection passed. No files or packages were changed."
+        exit 0
     }
-
-    if ($MemoryMiB -lt 8000) {
-        throw "This test release requires an 8GB-class GPU or larger."
-    }
-
-    if ($DriverVersion -lt [version]"560.76") {
-        throw "Please update the NVIDIA driver to 560.76 or newer."
+    if (-not (Test-Path -LiteralPath ".env")) {
+        Copy-Item -LiteralPath ".env.example" -Destination ".env"
     }
 
     # 3. Install uv locally, without adding it to the user's PATH.
@@ -107,8 +129,8 @@ try {
     Write-Host "`n[4/5] Installing dependencies..."
 
     & $Uv pip install --python $Python `
-        "torch==2.14.1+cu126" `
-        --index-url "https://download.pytorch.org/whl/cu126"
+        "torch==$($GpuProfile.Torch)" `
+        --index-url $GpuProfile.Index
     Check-ExitCode "PyTorch installation"
 
     & $Uv pip install --python $Python -r "requirements.txt"
@@ -121,7 +143,8 @@ try {
     Write-Host "`n[5/5] Verifying installation..."
     Write-Host "The first run downloads the ASR model."
 
-    & $Python -X utf8 "verify_install.py"
+    & $Python -X utf8 "verify_install.py" `
+        --expected-torch $GpuProfile.Torch --expected-cuda $GpuProfile.Cuda
     Check-ExitCode "Runtime verification"
 
     Write-Host "`nReady. Configure OPENAI_API_KEY, then run start.bat."

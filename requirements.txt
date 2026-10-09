@@ -1,4 +1,5 @@
-torch==2.14.1+cu126
+# install.ps1 selects cu126 or cu130; preserve that local build.
+torch==2.14.1
 transformers==5.19.0
 numpy==1.26.4
 PyAudioWPatch==0.2.12.9
