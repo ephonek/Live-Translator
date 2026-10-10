@@ -8,8 +8,7 @@ from huggingface_hub.utils import disable_progress_bars
 MODEL_ID = 'Qwen/Qwen3-ASR-1.7B-hf'
 
 
-class ASRLengthLimitError(RuntimeError):
-    """Recoverable failure of a single audio segment, not a device failure."""
+from asr_models import ASRLengthLimitError
 
 
 class QwenASR:

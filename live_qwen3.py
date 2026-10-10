@@ -8,6 +8,7 @@ import threading
 import time
 SESSION_STARTED = time.monotonic()
 api_sequence = 0
+TRANSLATION_MODEL = 'gpt-5.4-mini'
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -19,8 +20,9 @@ load_dotenv(
 )
 
 import numpy as np
-import torch
-from qwen_backend import QwenASR, ASRLengthLimitError
+from asr_models import MODELS, ASRLengthLimitError
+from app_preferences import load_preferences, save_preferences, choice, recommended_model, resolve_source
+from asr_process import ASRProcess
 from audio_source import AudioSource
 from two_pass_translation import translate_windows
 from faster_whisper.vad import get_speech_timestamps
@@ -29,12 +31,14 @@ from pydantic import BaseModel
 from scipy.signal import resample_poly
 
 
-LANGUAGE = sys.argv[1] if len(sys.argv) > 1 else "ja"
+preferences = load_preferences('runtime')
+LANGUAGE = next((a for a in sys.argv[1:] if a in ('ja', 'en')),
+                choice(preferences, 'language', ('ja', 'en'), 'ja'))
 SR = 16000
 KEEP_LOGS = "--keep-logs" in sys.argv
 
-MIN_SECONDS = 3.0
-MAX_SECONDS = 8.0
+MIN_SECONDS = 2.0
+MAX_SECONDS = 10.0
 PAUSE_SECONDS = 0.6
 VAD_INTERVAL = 0.1
 VAD_WINDOW = 2.0
@@ -58,8 +62,18 @@ language_epoch = 0
 PAUSE_FILE = OUTPUT.with_suffix(".pause.json")
 capture_paused = False
 MODE_FILE = OUTPUT.with_suffix(".mode.json")
-translation_mode = "sliding"
+translation_mode = choice(preferences, 'translation_mode', ('paired', 'sliding'), 'sliding')
 SOURCE_FILE = OUTPUT.with_suffix(".source.json")
+MODEL_FILE = OUTPUT.with_suffix(".asr.json")
+active_model = choice(preferences, 'model', MODELS, '') or recommended_model()
+if LANGUAGE not in MODELS[active_model]['languages']:
+    active_model = 'turbo'
+model_switching = threading.Event()
+model_switching.set()
+model_loading = threading.Event()
+model_loading.set()
+model_results = queue.SimpleQueue()
+last_model_request = None
 
 
 class Translation(BaseModel):
@@ -109,11 +123,6 @@ recording_stopped = threading.Event()
 
 client = OpenAI(timeout=20.0, max_retries=0)
 
-if not torch.cuda.is_available():
-    raise SystemExit("PyTorch 沒有偵測到 CUDA。")
-
-print("載入 Qwen3-ASR-1.7B 與 VAD……", flush=True)
-model = QwenASR()
 print(f"完整辨識紀錄：{RAW_OUTPUT}", flush=True)
 
 # 預先載入 VAD，避免第一次切段才初始化。
@@ -121,6 +130,15 @@ get_speech_timestamps(
     np.zeros(SR, dtype=np.float32),
     sampling_rate=SR,
 )
+
+
+def remember_runtime(**changes):
+    preferences.update(changes)
+    try:
+        save_preferences('runtime', {k: preferences[k] for k in
+            ('model', 'language', 'translation_mode', 'source_mode', 'source_name') if k in preferences})
+    except OSError as exc:
+        print(f'設定無法保存：{exc}', flush=True)
 
 
 def write_record(stream, record):
@@ -172,7 +190,7 @@ def translate_once(record, context, captured_at):
 
     try:
         response = client.responses.parse(
-            model="gpt-5.4-mini",
+            model=TRANSLATION_MODEL,
             reasoning={"effort": "none"},
             input=[
                 {"role": "system", "content": RULES},
@@ -255,18 +273,52 @@ def translate_worker(log):
 
 def worker():
     asr_call = 0
+    model = None
+
+    def change_model(key):
+        nonlocal model
+        previous = model.key if model is not None else None
+        if model is not None:
+            model.close()
+            model = None
+        def load(candidate):
+            publish('model_loading', {'model': candidate,
+                'message': '檢查快取／載入模型；首次使用會下載。此期間不辨識新音訊。'})
+            return ASRProcess(candidate, ROOT / 'models',
+                              cancelled=lambda: STOP_FILE.exists() or recording_stopped.is_set())
+        error = None
+        try:
+            model = load(key)
+        except InterruptedError:
+            return
+        except Exception as exc:
+            error = str(exc)
+            if previous and previous != key:
+                try:
+                    model = load(previous)
+                except InterruptedError:
+                    return
+                except Exception as recovery:
+                    error += f'；恢復舊模型也失敗：{recovery}'
+        model_results.put((model.key if model else None, model.backend if model else '', error))
+
     try:
         with OUTPUT.open("w", encoding="utf-8") as log, RAW_OUTPUT.open("w", encoding="utf-8") as raw_log:
             translator = threading.Thread(target=translate_worker, args=(log,))
             translator.start()
             try:
+                change_model(active_model)
                 while True:
                     job = jobs.get()
                     if job is None:
                         break
+                    if isinstance(job, str):
+                        change_model(job)
+                        continue
+                    if model is None:
+                        continue
                     audio, offset, emit_from, emit_to, captured_at, reason, job_language, job_epoch = job
                     asr_call += 1
-                    torch.cuda.synchronize()
                     started = time.perf_counter()
                     try:
                         source = model.transcribe(audio, job_language)
@@ -282,12 +334,12 @@ def worker():
                         publish('asr_failed', rejected)
                         print(f"第 {asr_call} 段辨識失敗（已拆段重試），略過並繼續：{exc}", flush=True)
                         continue
-                    torch.cuda.synchronize()
                     record = {
                         "asr_call": asr_call,
                         "language": job_language, "language_epoch": job_epoch,
                         "start": offset, "end": offset + len(audio) / SR,
                         "timestamp_kind": "audio_window", "cut_reason": reason,
+                        "asr_model": model.key, "asr_backend": model.backend,
                         "source": source,
                         "asr_seconds": round(time.perf_counter() - started, 3),
                         "asr_delay_after_capture_seconds": round(time.perf_counter() - captured_at, 3),
@@ -325,6 +377,9 @@ def worker():
     except Exception as exc:
         errors.put(f"辨識或存檔失敗：{exc}")
         failed.set()
+    finally:
+        if model is not None:
+            model.close()
 
 
 # 以下時間位置都以 16 kHz 的樣本數計算。
@@ -369,6 +424,47 @@ def submit(reason):
     buffer_start = total
 
 
+def check_model_request():
+    global active_model, last_model_request, language_epoch
+    while not model_results.empty():
+        key, backend, error = model_results.get()
+        active_model = key
+        if key is not None:
+            remember_runtime(model=key, language=LANGUAGE)
+        model_loading.clear()
+        if key is not None:
+            model_switching.clear()
+        language_epoch += 1
+        publish('model_changed', {'model': key, 'backend': backend, 'error': error})
+    if recording_stopped.is_set():
+        return
+    try:
+        request = json.loads(MODEL_FILE.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return
+    if not isinstance(request, dict) or request.get('request_id') == last_model_request:
+        return
+    key = request.get('model')
+    if key not in MODELS:
+        return
+    # A failed initial load leaves capture suspended, but still permits retry.
+    if model_loading.is_set():
+        return
+    last_model_request = request.get('request_id')
+    if LANGUAGE not in MODELS[key]['languages']:
+        publish('model_changed', {'model': active_model, 'error': 'Kotoba 只支援日文，請先切換 JP。'})
+        return
+    if key == active_model:
+        publish('model_changed', {'model': active_model, 'backend': '目前已使用此模型'})
+        return
+    submit('切換模型')
+    model_switching.set()
+    model_loading.set()
+    language_epoch += 1
+    publish('model_loading', {'model': key, 'message': '完成佇列後切換；此期間不辨識新音訊。'})
+    jobs.put_nowait(key)
+
+
 def check_language_request():
     global LANGUAGE, language_epoch
     try:
@@ -379,9 +475,16 @@ def check_language_request():
         return
     if requested not in ('en', 'ja') or requested == LANGUAGE:
         return
+    if model_loading.is_set():
+        return
+    if active_model and requested not in MODELS[active_model]['languages']:
+        LANGUAGE_FILE.write_text(json.dumps({'language': LANGUAGE}), encoding='utf-8')
+        publish('language_changed', {'language': LANGUAGE, 'rejected': True})
+        return
     # 尚未送出的音訊用舊語言收尾，已排入佇列的工作持有自己的語言快照。
     submit('切換語言')
     LANGUAGE = requested
+    remember_runtime(language=LANGUAGE)
     language_epoch += 1
     publish('language_changed', {'language': LANGUAGE})
     print(f'辨識語言已切換：{LANGUAGE}', flush=True)
@@ -418,7 +521,7 @@ def accept_packet(data, captured_at, rate, channels, divisor):
         audio, SR // divisor, rate // divisor
     ).astype(np.float32)
 
-    if capture_paused:
+    if capture_paused or model_switching.is_set():
         total += len(audio)
         buffer = np.empty(0, dtype=np.float32)
         buffer_start = last_cut = emit_cursor = last_vad = total
@@ -462,18 +565,25 @@ def accept_packet(data, captured_at, rate, channels, divisor):
 
 
 # 字幕視窗只讀本次紀錄；Tk 在獨立程序運作，不阻塞錄音。
-publish("session_started", {"elapsed_seconds": time.monotonic() - SESSION_STARTED})
+publish("session_started", {"elapsed_seconds": time.monotonic() - SESSION_STARTED, "translation_model": TRANSLATION_MODEL})
 LANGUAGE_FILE.write_text(json.dumps({"language": LANGUAGE}), encoding="utf-8")
 PAUSE_FILE.write_text(json.dumps({"paused": False}), encoding="utf-8")
 MODE_FILE.write_text(json.dumps({"mode": translation_mode}), encoding="utf-8")
-SOURCE_FILE.write_text(json.dumps({"mode": "device", "request_id": "initial"}), encoding="utf-8")
+try:
+    from process_audio import list_applications
+    initial_source = resolve_source(preferences, list_applications() if preferences.get('source_mode') == 'process' else [])
+except OSError:
+    initial_source = None
+SOURCE_FILE.write_text(json.dumps(initial_source or {}), encoding='utf-8')
+if initial_source is None:
+    publish('source_error', {'request_id': 'initial', 'error': '上次的程式尚未開啟或有多個候選；請在設定重新選擇。'})
 subtitle_process = None
 if "--no-window" not in sys.argv:
     try:
         subtitle_process = subprocess.Popen(
             [sys.executable, "-X", "utf8", str(ROOT / "subtitle_window.py"),
              "--log", str(EVENT_OUTPUT), "--stop-file", str(STOP_FILE),
-             "--title", "直播字幕 · Qwen3-ASR-1.7B",
+             "--title", "直播字幕", "--model-file", str(MODEL_FILE),
              "--language-file", str(LANGUAGE_FILE), "--language", LANGUAGE,
              "--pause-file", str(PAUSE_FILE), "--mode-file", str(MODE_FILE), "--source-file", str(SOURCE_FILE)],
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
@@ -509,6 +619,10 @@ try:
     while not failed.is_set() and not STOP_FILE.exists():
         check_pause_request()
         check_language_request()
+        check_model_request()
+        read_translation_mode()
+        if preferences.get('translation_mode') != translation_mode:
+            remember_runtime(translation_mode=translation_mode)
         try:
             request = json.loads(SOURCE_FILE.read_text(encoding='utf-8'))
         except (OSError, ValueError):
@@ -518,6 +632,7 @@ try:
             finish_source()
             try:
                 source = AudioSource(request).start()
+                remember_runtime(source_mode=request['mode'], source_name=request.get('name', ''))
                 publish('source_changed', {'request_id': last_source_request, 'name': source.name,
                                           'mode': request['mode']})
                 print(f'擷取：{source.name}', flush=True)
@@ -580,5 +695,6 @@ finally:
     PAUSE_FILE.unlink(missing_ok=True)
     MODE_FILE.unlink(missing_ok=True)
     SOURCE_FILE.unlink(missing_ok=True)
+    MODEL_FILE.unlink(missing_ok=True)
 
     cleanup_session_logs()

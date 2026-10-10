@@ -7,6 +7,6 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-".venv\Scripts\python.exe" -X utf8 live_qwen3.py en
+".venv\Scripts\python.exe" -X utf8 live_qwen3.py
 
 pause

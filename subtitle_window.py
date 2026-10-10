@@ -1,4 +1,6 @@
 """Local subtitle viewer. It only reads the transcript; closing requests a stop."""
+from asr_models import MODELS
+from app_preferences import load_preferences, save_preferences, choice, bounded, flag
 import argparse
 import json
 import os
@@ -182,8 +184,12 @@ class PillButton(tk.Canvas):
 
 
 class SubtitleWindow:
-    def __init__(self, root, log, stop_file, language_file=None, language="ja", pause_file=None, mode_file=None, source_file=None):
+    def __init__(self, root, log, stop_file, language_file=None, language="ja", pause_file=None, mode_file=None, source_file=None, model_file=None):
         self.root = root
+        self.saved_window = load_preferences('window')
+        self.saved_runtime = load_preferences('runtime')
+        self._save_after = None
+        self._last_saved_window = None
         self.tail = TranscriptTail(log)
         self.stop_file = Path(stop_file)
         self.language_file = Path(language_file) if language_file else None
@@ -191,15 +197,22 @@ class SubtitleWindow:
         self.active_language = language
         self.pause_file = Path(pause_file) if pause_file else None
         self.source_file = Path(source_file) if source_file else None
-        self.source_mode = tk.StringVar(value='device')
+        self.model_file = Path(model_file) if model_file else None
+        self.model_choice = tk.StringVar(value=MODELS[choice(self.saved_runtime, 'model', MODELS, 'qwen')]['label'])
+        self.model_status = tk.StringVar(value='正在啟動 ASR…')
+        self.model_busy = True
+        self.active_model_label = '載入中'
+        self.translation_model_label = '等待連線'
+        self.models_label = tk.StringVar(value='ASR：載入中 ｜ 翻譯：等待連線')
+        self.source_mode = tk.StringVar(value=choice(self.saved_runtime, 'source_mode', ('device', 'process'), 'device'))
         self.source_choice = tk.StringVar()
         self.source_status = tk.StringVar(value='音訊來源：整個輸出裝置')
         self.source_request_id = None
         self.applications = []
         self.mode_file = Path(mode_file) if mode_file else None
-        self.selected_mode = tk.StringVar(value='sliding')
-        self.active_mode = 'sliding'
-        self.mode_status = tk.StringVar(value='目前：逐段滑動')
+        self.active_mode = choice(self.saved_runtime, 'translation_mode', ('paired', 'sliding'), 'sliding')
+        self.selected_mode = tk.StringVar(value=self.active_mode)
+        self.mode_status = tk.StringVar(value='目前：' + ('逐段滑動' if self.active_mode == 'sliding' else '兩段合併'))
         self.paused = False
         self.pause_requested = tk.BooleanVar(value=False)
         self.language_status = tk.StringVar(value="辨識語言")
@@ -325,6 +338,18 @@ class SubtitleWindow:
             for label, code in [('兩段合併', 'paired'), ('逐段滑動', 'sliding')]:
                 PillButton(modes, label, self.request_mode, self.selected_mode, code).pack(side='left', padx=3)
             tk.Label(modes, textvariable=self.mode_status, bg=panel, fg=muted).pack(side='left', padx=10)
+        if self.model_file is not None:
+            models = tk.Frame(self.settings_panel, bg=panel)
+            models.pack(fill='x', pady=(6, 2))
+            tk.Label(models, text='辨識模型', bg=panel, fg=muted).pack(side='left', padx=(0, 8))
+            self.model_combo = ttk.Combobox(models, textvariable=self.model_choice, state='readonly',
+                                           values=[v['label'] for v in MODELS.values()], width=28)
+            self.model_combo.pack(side='left', fill='x', expand=True, padx=4)
+            self.model_button = PillButton(models, '切換模型', self.request_model)
+            self.model_button.pack(side='left', padx=4)
+            self.model_button.configure(state='disabled')
+            tk.Label(self.settings_panel, textvariable=self.model_status, bg=panel, fg=muted,
+                     wraplength=620, anchor='w', justify='left').pack(fill='x')
         if self.source_file is not None:
             sources = tk.Frame(self.settings_panel, bg=panel)
             sources.pack(fill='x', pady=(6, 0))
@@ -381,10 +406,72 @@ class SubtitleWindow:
         self.usage_panel = UsagePanel(self.drawer, self.usage)
         self.drawer.grid_remove()
         self.usage_label = tk.StringVar(value='0 tokens')
-        tk.Label(footer, textvariable=self.usage_label, bg=bg, fg='#90e2ce',
-                 font=('Microsoft JhengHei UI', 9)).grid(row=1, column=0, sticky='w')
+        metadata = tk.Frame(footer, bg=bg)
+        metadata.grid(row=1, column=0, columnspan=4, sticky='ew', pady=(2, 0))
+        metadata.columnconfigure(2, weight=1)
+        tk.Label(metadata, textvariable=self.usage_label, bg=bg, fg='#90e2ce',
+                 font=('Microsoft JhengHei UI', 9)).grid(row=0, column=0, sticky='w')
+        tk.Label(metadata, text='·', bg=bg, fg=muted,
+                 font=('Microsoft JhengHei UI', 9)).grid(row=0, column=1, padx=8)
+        tk.Label(metadata, textvariable=self.models_label, bg=bg, fg=muted,
+                 font=('Microsoft JhengHei UI', 9), anchor='w').grid(row=0, column=2, sticky='ew')
+        self.restore_preferences()
+        for var in (self.opacity, self.transparent, self.topmost, self.show_original,
+                    self.show_llm_original, self.compact, self.settings_open, self.size_label):
+            var.trace_add('write', lambda *args: self.schedule_preferences())
+        root.bind('<Configure>', lambda e: self.schedule_preferences() if e.widget is root else None, add='+')
         root.after(100, self.poll)
         root.after(250, self.overlay_tick)
+
+    def schedule_preferences(self):
+        if self._save_after is not None:
+            self.root.after_cancel(self._save_after)
+        self._save_after = self.root.after(700, self.store_preferences)
+
+    def store_preferences(self):
+        self._save_after = None
+        if self.root.state() == 'iconic':
+            return
+        data = {key: getattr(self, key).get() for key in
+                ('opacity', 'transparent', 'topmost', 'show_original', 'show_llm_original', 'compact', 'settings_open')}
+        data.update(size=self.size, x=self.root.winfo_x(), y=self.root.winfo_y(),
+                    width=self.root.winfo_width(), height=self.root.winfo_height())
+        if self.drawer_mode is not None:
+            data['height'] = self._before_drawer_height
+            data['x'], data['y'] = self._before_drawer_position
+        if data == self._last_saved_window:
+            return
+        try:
+            save_preferences('window', data)
+            self._last_saved_window = data
+        except OSError as exc:
+            self.status.set(f'設定無法保存：{exc}')
+
+    def restore_preferences(self):
+        data = self.saved_window
+        for key, default in [('transparent', False), ('topmost', True), ('show_original', True),
+                             ('show_llm_original', True), ('compact', False), ('settings_open', False)]:
+            getattr(self, key).set(flag(data, key, default))
+        self.opacity.set(bounded(data, 'opacity', 95, 55, 100))
+        self.resize(bounded(data, 'size', 26, 14, 64) - self.size)
+        self.root.attributes('-topmost', self.topmost.get())
+        self.apply_opacity()
+        if self.compact.get():
+            self.settings_open.set(False)
+            self.toggle_compact()
+        self.toggle_settings()
+        self.toggle_original()
+        self.root.update_idletasks()
+        width = bounded(data, 'width', 900, 660, 7680)
+        height = bounded(data, 'height', 300 if self.compact.get() else 540, 260, 4320)
+        x = bounded(data, 'x', self.root.winfo_x(), -32000, 32000)
+        y = bounded(data, 'y', self.root.winfo_y(), -32000, 32000)
+        self.set_window_bounds(x, y, width, height)
+        self.root.update_idletasks()
+        # Clamp to the nearest monitor, including monitors with negative coordinates.
+        left, top, right, bottom = self.work_area()
+        width, height = min(width, right-left), min(height, bottom-top)
+        self.set_window_bounds(max(left,min(x,right-width)), max(top,min(y,bottom-height)), width,height)
 
     def set_window_bounds(self, left, top, width=None, height=None):
         if os.name == 'nt':
@@ -490,7 +577,7 @@ class SubtitleWindow:
                 self.compact.set(False)
                 self.toggle_compact()
             self.settings_panel.grid()
-            self.root.minsize(760, 580)
+            self.root.minsize(760, 650 if self.model_file else 580)
         else:
             self.settings_panel.grid_remove()
             self.root.minsize(660, 260 if self.compact.get() else 330)
@@ -587,6 +674,8 @@ class SubtitleWindow:
             self.application_combo.configure(values=[f"{r['name']} · {r['pid']} · {r['title']}" for r in self.applications])
             index = next((i for i,r in enumerate(self.applications) if previous and
                           (r['pid'],r['created']) == (previous['pid'],previous['created'])), 0)
+            if previous is None:
+                index = next((i for i,r in enumerate(self.applications) if r['name'] == self.saved_runtime.get('source_name')), index)
             if self.applications: self.application_combo.current(index)
             else: self.source_choice.set('沒有可選程式，請先開啟瀏覽器')
         except OSError as exc:
@@ -610,6 +699,21 @@ class SubtitleWindow:
             self.source_status.set('正在切換音訊來源…')
         except OSError as exc:
             self.source_status.set(f'音訊來源切換失敗：{exc}')
+
+    def request_model(self):
+        if self.stopped or self.model_busy or self.model_file is None:
+            return
+        key = next(k for k, v in MODELS.items() if v['label'] == self.model_choice.get())
+        if self.active_language not in MODELS[key]['languages']:
+            self.model_status.set('Kotoba 只支援日文，請先切換 JP。')
+            return
+        temporary = self.model_file.with_suffix('.tmp')
+        try:
+            temporary.write_text(json.dumps({'model': key, 'request_id': str(time.time_ns())}), encoding='utf-8')
+            temporary.replace(self.model_file)
+            self.model_status.set('已送出切換要求…')
+        except OSError as exc:
+            self.model_status.set(f'無法切換：{exc}')
 
     def request_mode(self):
         if self.stopped or self.mode_file is None:
@@ -670,6 +774,7 @@ class SubtitleWindow:
             self.stop_button.configure(state='disabled')
 
     def close(self):
+        self.store_preferences()
         self.request_stop()
         self.root.destroy()
 
@@ -754,6 +859,9 @@ class SubtitleWindow:
                 if row.get('event') in ('session_started', 'api_usage', 'session_stopped'):
                     self.elapsed_base = row.get('elapsed_seconds', self.elapsed_seconds())
                     self.elapsed_anchor = time.monotonic()
+                    if row.get('translation_model'):
+                        self.translation_model_label = row['translation_model']
+                        self.models_label.set(f'ASR：{self.active_model_label} ｜ 翻譯：{self.translation_model_label}')
                 if row.get('event') == 'api_usage':
                     self.usage.accept(row)
                 elif row.get('event') in ('source_changed', 'source_error'):
@@ -762,6 +870,22 @@ class SubtitleWindow:
                             self.source_status.set('擷取中：' + row['name'])
                         else:
                             self.source_status.set('未收音：' + row['error'])
+                elif row.get('event') in ('model_loading', 'model_changed'):
+                    loading = row['event'] == 'model_loading'
+                    self.model_busy = loading
+                    if self.model_file is not None:
+                        self.model_button.configure(state='disabled' if loading else 'normal')
+                    key = row.get('model')
+                    label = MODELS[key]['label'] if key in MODELS else '未載入模型'
+                    self.active_model_label = ('切換中 → ' if loading else '') + label
+                    self.models_label.set(f'ASR：{self.active_model_label} ｜ 翻譯：{self.translation_model_label}')
+                    if not loading and key in MODELS:
+                        self.model_choice.set(label)
+                    message = row.get('message') if loading else row.get('backend', '')
+                    self.model_status.set(label + ' · ' + (message or '') +
+                                          (' · ' + row['error'] if row.get('error') else ''))
+                    self.status.set('載入模型中 · 暫停辨識' if loading else
+                                    ('模型未就緒 · 請在設定重試' if key is None else label + ' · 已就緒'))
                 elif row.get('event') == 'mode_changed':
                     self.active_mode = row['mode']
                     label = '兩段合併' if self.active_mode == 'paired' else '逐段滑動'
@@ -777,9 +901,14 @@ class SubtitleWindow:
                     self.status.set('已暫停 · 已送出的翻譯仍會完成' if self.paused else '已繼續辨識')
                 elif row.get('event') == 'language_changed':
                     self.active_language = row['language']
+                    if row.get('rejected'):
+                        self.selected_language.set(self.active_language)
+                        self.model_status.set('Kotoba 只支援日文；切換其他模型後才能選 EN。')
                     self.language_status.set('辨識語言' if self.selected_language.get() == self.active_language else '等待切換')
                 elif row.get('status') == 'session_stopped':
                     self.stopped = True
+                    if self.model_file is not None:
+                        self.model_button.configure(state='disabled')
                     self.stage.set('已停止')
                     self.stop_button.configure(state='disabled')
                     self.pause_button.configure(state='disabled')
@@ -818,10 +947,11 @@ if __name__ == '__main__':
     parser.add_argument('--pause-file')
     parser.add_argument('--mode-file')
     parser.add_argument('--source-file')
+    parser.add_argument('--model-file')
     parser.add_argument('--language-file')
     parser.add_argument('--language', choices=['en', 'ja'], default='ja')
     args = parser.parse_args()
     root = tk.Tk()
-    app = SubtitleWindow(root, args.log, args.stop_file, args.language_file, args.language, args.pause_file, args.mode_file, args.source_file)
+    app = SubtitleWindow(root, args.log, args.stop_file, args.language_file, args.language, args.pause_file, args.mode_file, args.source_file, args.model_file)
     root.title(args.title)
     root.mainloop()

@@ -15,8 +15,8 @@ function Get-GpuProfile([string]$Name, [version]$Driver, [int]$MemoryMiB) {
         throw "Supported GPUs: GeForce RTX 20/30/40/50 series. Detected: $Name"
     }
     $Series = $Matches[1]
-    if ($MemoryMiB -lt 8000) {
-        throw "This release requires an 8GB-class GPU or larger."
+    if ($MemoryMiB -lt 4000) {
+        throw "This release requires a 4GB-class GPU or larger."
     }
     $CudaBuild = 'cu126'
     $CudaVersion = '12.6'

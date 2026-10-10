@@ -2,7 +2,11 @@ import argparse
 import tkinter as tk
 import torch
 
-from qwen_backend import QwenASR
+from asr_process import ASRProcess
+from asr_models import MODELS
+from app_preferences import load_preferences, save_preferences, choice, recommended_model
+from pathlib import Path
+import numpy as np
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--expected-torch')
@@ -49,7 +53,17 @@ root.update()
 root.destroy()
 
 # Download the model if necessary and check GPU loading.
-print("Loading Qwen3-ASR. First download may take a while.")
-model = QwenASR()
+settings = load_preferences('runtime')
+key = choice(settings, 'model', MODELS, '') or recommended_model(torch.cuda.get_device_properties(0).total_memory // (1024*1024))
+print(f"Loading {key}. First download may take a while.")
+model = ASRProcess(key, Path(__file__).resolve().parent / 'models')
+try:
+    # Nonzero input exercises inference instead of taking the silence shortcut.
+    sample = (np.sin(np.arange(16000, dtype=np.float32)*.04)*.001).astype(np.float32)
+    model.transcribe(sample, 'ja')
+finally:
+    model.close()
+settings['model'] = key
+save_preferences('runtime', settings)
 
 print("GPU, GUI and model loading checks passed.")

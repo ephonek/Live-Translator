@@ -6,13 +6,14 @@
 
 ## 功能
 
-- 本機 Qwen3-ASR 語音辨識
+- 本機 Qwen3-ASR／Whisper turbo／Kotoba 語音辨識
 - OpenAI API 繁體中文翻譯
 - 英文／日文切換
 - 無框、置頂字幕視窗，可調整大小與透明度
 - 即時原文與翻譯分開顯示
 - 可收合的歷史字幕與 token 用量圖表
 - 暫停／繼續收音
+- 自動保存設定，底部顯示目前 ASR 與翻譯模型
 
 ### 翻譯模式
 
@@ -30,7 +31,7 @@
 
 - Windows x64
 - 單張 NVIDIA GeForce RTX 20／30／40／50 系列顯卡
-- 至少 8GB 等級顯存
+- 至少 4GB 等級顯存（4～6GB 預設 Whisper turbo；Qwen 建議 8GB 以上）
 - RTX 20／30／40：NVIDIA 驅動 560.76 或更新（PyTorch 2.14.1＋CUDA 12.6）
 - RTX 50：NVIDIA 驅動 580.88 或更新（PyTorch 2.14.1＋CUDA 13.0）
 - 網際網路連線
@@ -135,6 +136,33 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -CheckOnly
 安裝器不會覆蓋已存在的 `.env`。
 建立環境後請避免直接搬動資料夾；換位置時建議重新安裝。
 
+## 切換辨識模型
+
+字幕視窗「設定 → 辨識模型」選擇模型，再按「切換模型」。
+
+| 模型 | 語言 | 用途 |
+| --- | --- | --- |
+| Qwen3-ASR-1.7B | 日文、英文 | 原本的預設模型 |
+| Whisper large-v3-turbo | 日文、英文 | 可與 Qwen 比較同一段音訊 |
+| Kotoba-Whisper v2.0 | 日文 | 日本語專用，請先切到 JP |
+
+只下載選用的模型，之後重用快取，不用重裝 Python 環境。重新啟動會沿用上次成功使用的模型。首次使用時，8GB 以上預設 Qwen，4～6GB 預設 Whisper turbo。
+切換時會先處理已排入的音訊，關閉舊 ASR 程序、釋放顯存後才載入新模型。
+載入期間略過新音訊，不會累積成延遲；字幕歷史與已排入的翻譯仍保留。
+載入失敗會嘗試恢復原模型；若仍失敗，可在設定中重新選擇。
+首次下載可能需要數分鐘，可按停止取消。手動暫停狀態不受模型切換影響。
+
+CUDA 12／RTX 20–40 的 Whisper 使用 faster-whisper INT8/FP16，並重用專案的 `models/` 快取。
+CUDA 13／RTX 50 改用 Transformers FP16，避免依賴 CUDA 12 的 CTranslate2 DLL；
+此路徑使用原始 Hugging Face 模型快取，實際速度與顯存仍需在 RTX 50 上驗證。
+Whisper 關閉跨音訊段的文字延續，翻譯的四筆上下文與滑動視窗照常運作。
+Kotoba 仍是 Whisper 架構，不保證沒有幻覺或一定比其他模型準確。
+
+模型來源：[Qwen](https://huggingface.co/Qwen/Qwen3-ASR-1.7B-hf)、
+[Whisper turbo](https://huggingface.co/openai/whisper-large-v3-turbo)、
+[Kotoba](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0)、
+[Kotoba faster](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0-faster)。
+
 ## 已知限制
 
 - 字幕有延遲，不是同步口譯。
@@ -178,3 +206,41 @@ OpenAI API 進行翻譯。使用者應了解相關資料處理方式，
 亦不表示獲得上述組織的認可或背書。
 
 
+
+## 自動保存設定
+
+模型、辨識語言、翻譯模式與成功套用的音訊來源保存於 `config/runtime.json`。
+字體大小、不透明度、透明背景、置頂、原文顯示、字幕模式與視窗位置大小保存於 `config/window.json`。
+設定自動保存，無須按儲存；不包含 API key、字幕歷史或 token 用量。暫停狀態不跨次保留。
+`start.bat` 與本機快捷啟動不再固定英文；手動 `python live_qwen3.py en` 仍可指定本次語言。
+若選 Kotoba 卻指定英文，該次改用 Whisper turbo。
+
+指定程式以程式名稱重新尋找，絕不沿用舊 PID。若未開啟或有多個同名候選，會等待重新選擇，
+不會偷偷改成擷取全部輸出。拔除副螢幕後，視窗會移回可用螢幕範圍。
+設定檔損壞會回到預設值；要重設可在關閉程式後刪除 `config/`。這個資料夾已排除於 Git。
+
+安裝門檻調整為 4GB 級 RTX 顯卡；4～6GB 的預設方案是 Whisper turbo INT8/FP16，
+不是所有模型都保證能在 4GB 使用。仍需保留瀏覽器、桌面與其他 GPU 程式的顯存空間。
+RTX 50 的 Transformers 後端不使用 INT8，低顯存實際表現仍需另行測試。
+
+## 一鍵更新（Git 安裝）
+
+先停止翻譯並關閉字幕視窗，再雙擊 `update.bat`。需要已安裝 Git for Windows，
+而且資料夾必須是 Git checkout，當前分支已設定遠端追蹤分支。
+
+- 只接受 fast-forward 更新，不會自動合併、reset、清除檔案或丟棄本機修改。
+- 保留 `.env`、`config/`、模型快取與安裝環境；遇到會覆蓋私人資料的版本會停止。
+- 依賴相關檔案有變動時，透過 `install.ps1` 更新 `.venv` 並驗證；沒有變動則跳過。
+- 依賴更新失敗時，程式碼可能已更新；修復原因後再次執行 `update.bat` 會重試依賴步驟。
+- Conda／自訂環境不會被自動修改；依賴有變更時會提示手動更新，或使用安裝器建立 `.venv`。
+- 可執行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\update.ps1 -CheckOnly`，只做本機檢查。
+
+ZIP 下載的資料夾沒有 `.git`，目前不支援直接更新。請在另一個新資料夾執行：
+
+```powershell
+git clone https://github.com/ephonek/Live-Translator.git
+```
+
+把原本的 `.env` 與 `config/` 複製到新專案，再執行新專案的 `install.bat`。
+可複製 `models/` 減少重新下載；不要搬移 `.venv`。確認新版本可用前保留原資料夾。
+之後就能使用 `update.bat`。專案作者需先 commit 並 push，新版本才會出現在朋友的更新中。
