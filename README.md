@@ -30,17 +30,17 @@
 目前安裝器限定：
 
 - Windows x64
-- 單張 NVIDIA GeForce GTX 10／RTX 20／30／40／50 系列顯卡
+- 單張 NVIDIA GeForce GTX 10／16／RTX 20／30／40／50 系列顯卡
 - 至少 4GB 等級顯存（4～6GB 預設 Whisper turbo；Qwen 建議 8GB 以上）
-- GTX 10、RTX 20／30／40：NVIDIA 驅動 560.76 或更新（PyTorch 2.14.1＋CUDA 12.6）
+- GTX 10／16、RTX 20／30／40：NVIDIA 驅動 560.76 或更新（PyTorch 2.14.1＋CUDA 12.6）
 - RTX 50：NVIDIA 驅動 580.88 或更新（PyTorch 2.14.1＋CUDA 13.0）
 - 網際網路連線
 - 自己的 OpenAI API key，以及可用的 API 額度
 
 目前主要在 RTX 3070 Ti 8GB 上測試。GTX 10 系列為待實機驗證的相容方案：
 至少 4GB 等級顯存（例如 1050 Ti 4GB、1060 6GB、1070、1080／1080 Ti）；2GB／3GB 仍不開放。
-GTX 首次使用預設 Whisper turbo，可切換日文 Kotoba；仍保留已儲存的模型選擇。
-Qwen 在 GTX 為實驗選項，改用 FP32，顯存需求高於 RTX 的 FP16 路徑。1080 Ti 11GB 可嘗試，
+GTX 10 首次使用預設 Whisper turbo，可切換日文 Kotoba；仍保留已儲存的模型選擇。
+Qwen 在 GTX 10 為實驗選項，改用 FP32，顯存需求高於 RTX 的 FP16 路徑。1080 Ti 11GB 可嘗試，
 但是否放得下、能否即時辨識仍需實測；4～6GB 建議使用 Whisper。原有辨識時間預算與積壓保護保持啟用。
 更新後重新執行 `install.bat`，使用固定的 CUDA 12.6 與 CTranslate2 4.8.2；不要自行升級 CUDA 13 套件。
 安裝最後會實際執行 GPU 辨識。能成功安裝不代表在所有 GTX 上都能達到直播所需速度。
@@ -158,7 +158,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -CheckOnly
 載入失敗會嘗試恢復原模型；若仍失敗，可在設定中重新選擇。
 首次下載可能需要數分鐘，可按停止取消。手動暫停狀態不受模型切換影響。
 
-CUDA 12 的 Whisper 依 CTranslate2 回報的 GPU 能力選擇 INT8/FP16（RTX 20–40）或 INT8/FP32（GTX 10），並重用專案的 `models/` 快取。
+CUDA 12 的 Whisper 依 CTranslate2 回報的 GPU 能力選擇 INT8/FP16（GTX 16／RTX 20–40）或 INT8/FP32（GTX 10），並重用專案的 `models/` 快取。
 CUDA 13／RTX 50 改用 Transformers FP16，避免依賴 CUDA 12 的 CTranslate2 DLL；
 此路徑使用原始 Hugging Face 模型快取，實際速度與顯存仍需在 RTX 50 上驗證。
 Whisper 關閉跨音訊段的文字延續，翻譯的四筆上下文與滑動視窗照常運作。
@@ -225,7 +225,7 @@ OpenAI API 進行翻譯。使用者應了解相關資料處理方式，
 不會偷偷改成擷取全部輸出。拔除副螢幕後，視窗會移回可用螢幕範圍。
 設定檔損壞會回到預設值；要重設可在關閉程式後刪除 `config/`。這個資料夾已排除於 Git。
 
-安裝門檻調整為 4GB 級 GTX 10／RTX 顯卡；4～6GB 的預設方案是 Whisper turbo（RTX 為 INT8/FP16，GTX 10 為 INT8/FP32），
+安裝門檻調整為 4GB 級 GTX 10／16／RTX 顯卡；4～6GB 的預設方案是 Whisper turbo（GTX 16／RTX 為 INT8/FP16，GTX 10 為 INT8/FP32），
 不是所有模型都保證能在 4GB 使用。仍需保留瀏覽器、桌面與其他 GPU 程式的顯存空間。
 RTX 50 的 Transformers 後端不使用 INT8，低顯存實際表現仍需另行測試。
 

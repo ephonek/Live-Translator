@@ -11,8 +11,8 @@ function Check-ExitCode([string]$Step) {
 }
 
 function Get-GpuProfile([string]$Name, [version]$Driver, [int]$MemoryMiB) {
-    if ($Name -notmatch '(?:GTX\s+(10)|RTX\s+(20|30|40|50))\d{2}(?:\D|$)') {
-        throw "Supported GPUs: GeForce GTX 10 or RTX 20/30/40/50 series (4GB+). Detected: $Name"
+    if ($Name -notmatch '(?:GTX\s+(10|16)|RTX\s+(20|30|40|50))\d{2}(?:\D|$)') {
+        throw "Supported GPUs: GeForce GTX 10/16 or RTX 20/30/40/50 series (4GB+). Detected: $Name"
     }
     $Series = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
     if ($MemoryMiB -lt 4000) {
