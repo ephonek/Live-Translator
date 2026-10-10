@@ -16,6 +16,7 @@ def main():
 
     try:
         from asr_models import MODELS, ASRLengthLimitError
+        from gpu_compat import choose_compute_type, check_native_backend
         import numpy as np
         from huggingface_hub.utils import disable_progress_bars
         disable_progress_bars()
@@ -29,7 +30,8 @@ def main():
             from qwen_backend import QwenASR
             model = QwenASR()
             recognize = model.transcribe
-            backend = 'Transformers FP16'
+            backend = ('Transformers FP32（GTX 實驗模式：高顯存／可能較慢）'
+                       if model.model.dtype == torch.float32 else 'Transformers FP16')
         else:
             # CUDA 13 / Blackwell use the native PyTorch backend; CT2 requires CUDA 12.
             from importlib.util import find_spec
@@ -44,10 +46,12 @@ def main():
             if use_ct2:
                 os.environ['PATH'] = str(lib) + os.pathsep + os.environ.get('PATH', '')
                 dll_handle = os.add_dll_directory(str(lib)) if os.name == 'nt' else None
+                import ctranslate2
+                compute_type = choose_compute_type(ctranslate2.get_supported_compute_types('cuda', 0))
                 from faster_whisper import WhisperModel
-                model = WhisperModel(spec['ct2'], device='cuda', compute_type='int8_float16',
+                model = WhisperModel(spec['ct2'], device='cuda', compute_type=compute_type,
                                      download_root=cache_dir, cpu_threads=4, num_workers=1)
-                backend = 'faster-whisper INT8/FP16'
+                backend = 'faster-whisper ' + ('INT8/FP16' if compute_type == 'int8_float16' else 'INT8/FP32')
 
                 def recognize(audio, language):
                     segments, _ = model.transcribe(audio, language=language, task='transcribe',
@@ -67,6 +71,7 @@ def main():
                 torch.set_num_threads(min(4, os.cpu_count() or 1))
                 if not torch.cuda.is_available():
                     raise RuntimeError('PyTorch 沒有偵測到 CUDA。')
+                check_native_backend(torch.cuda.get_device_capability(0))
                 synchronize = torch.cuda.synchronize
                 from transformers import AutoProcessor, WhisperForConditionalGeneration
                 processor = AutoProcessor.from_pretrained(spec['hf'])

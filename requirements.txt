@@ -4,6 +4,8 @@ transformers==5.19.0
 numpy==1.26.4
 PyAudioWPatch==0.2.12.9
 faster-whisper==1.2.1
+# Keep the tested CUDA 12 / Pascal backend; upgrades require GPU verification.
+ctranslate2==4.8.2
 openai==3.26.1
 pydantic==2.14.0
 scipy==1.17.1

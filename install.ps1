@@ -11,10 +11,10 @@ function Check-ExitCode([string]$Step) {
 }
 
 function Get-GpuProfile([string]$Name, [version]$Driver, [int]$MemoryMiB) {
-    if ($Name -notmatch 'RTX\s+(20|30|40|50)\d{2}(?:\D|$)') {
-        throw "Supported GPUs: GeForce RTX 20/30/40/50 series. Detected: $Name"
+    if ($Name -notmatch '(?:GTX\s+(10)|RTX\s+(20|30|40|50))\d{2}(?:\D|$)') {
+        throw "Supported GPUs: GeForce GTX 10 or RTX 20/30/40/50 series (4GB+). Detected: $Name"
     }
-    $Series = $Matches[1]
+    $Series = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
     if ($MemoryMiB -lt 4000) {
         throw "This release requires a 4GB-class GPU or larger."
     }
@@ -27,7 +27,7 @@ function Get-GpuProfile([string]$Name, [version]$Driver, [int]$MemoryMiB) {
         $MinimumDriver = [version]'580.88'
     }
     if ($Driver -lt $MinimumDriver) {
-        throw "RTX $Series series requires driver $MinimumDriver or newer for $CudaBuild. Detected: $Driver"
+        throw "$Name requires driver $MinimumDriver or newer for $CudaBuild. Detected: $Driver"
     }
     return [pscustomobject]@{
         Torch = "2.14.1+$CudaBuild"
@@ -76,6 +76,9 @@ try {
 
     $GpuProfile = Get-GpuProfile $GpuName $DriverVersion $MemoryMiB
     Write-Host "Selected PyTorch: $($GpuProfile.Torch) / CUDA $($GpuProfile.Cuda)"
+    if ($GpuName -match 'GTX\s+10\d{2}') {
+        Write-Host 'Pascal: default Whisper INT8/FP32. Qwen FP32 is experimental (high VRAM usage).'
+    }
     if ($CheckOnly) {
         Write-Host "Hardware selection passed. No files or packages were changed."
         exit 0

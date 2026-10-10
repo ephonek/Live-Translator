@@ -17,11 +17,15 @@ class QwenASR:
     def __init__(self):
         if not torch.cuda.is_available():
             raise RuntimeError('PyTorch 沒有偵測到 CUDA。')
+        capability = torch.cuda.get_device_capability(0)
+        if capability < (7, 0) and torch.version.cuda != '12.6':
+            raise RuntimeError('GTX 10 系列請使用 CUDA 12.6，重新執行 install.bat。')
+        dtype = torch.float32 if capability < (7, 0) else torch.float16
         disable_progress_bars()
         logging.disable_progress_bar()
         self.processor = AutoProcessor.from_pretrained(MODEL_ID)
         self.model = Qwen3ASRForConditionalGeneration.from_pretrained(
-            MODEL_ID, dtype=torch.float16, attn_implementation='sdpa',
+            MODEL_ID, dtype=dtype, attn_implementation='sdpa',
         ).to('cuda').eval()
 
     def transcribe(self, audio, language):

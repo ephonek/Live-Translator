@@ -1,7 +1,7 @@
 """Validated, atomic preferences. Runtime and UI have separate writers."""
 import json
 import os
-import subprocess
+from gpu_compat import detect_gpu
 import tempfile
 from pathlib import Path
 
@@ -42,16 +42,14 @@ def flag(data, key, default):
     return value if type(value) is bool else default
 
 
-def recommended_model(memory_mib=None):
+def recommended_model(memory_mib=None, capability=None):
     if memory_mib is None:
-        try:
-            result = subprocess.run(['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
-                capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            memory_mib = int(result.stdout.splitlines()[0].strip())
-        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
-            return 'turbo'
-    return 'qwen' if memory_mib >= 8000 else 'turbo'
+        memory_mib, detected_capability = detect_gpu()
+        if capability is None:
+            capability = detected_capability
+    if capability is not None and capability < (7, 0):
+        return 'turbo'
+    return 'qwen' if memory_mib is not None and memory_mib >= 8000 else 'turbo'
 
 
 def resolve_source(saved, applications):
