@@ -15,6 +15,7 @@ from asr_models import ASRLengthLimitError
 class ASRProcess:
     def __init__(self, key, cache_dir, cancelled=lambda: False):
         self.key = key
+        self.last_stats = []
         self.responses = queue.Queue()
         self.diagnostics = deque(maxlen=12)
         self.process = subprocess.Popen(
@@ -59,6 +60,7 @@ class ASRProcess:
             except queue.Empty:
                 continue
             if message['event'] == 'length_error':
+                self.last_stats = message.get('stats', [])
                 raise ASRLengthLimitError(message['error'])
             if message['event'] == 'error':
                 raise RuntimeError(message['error'])
@@ -69,7 +71,10 @@ class ASRProcess:
         payload = {'language': language, 'audio': base64.b64encode(audio.astype('<f4', copy=False).tobytes()).decode('ascii')}
         self.process.stdin.write(json.dumps(payload) + '\n')
         self.process.stdin.flush()
-        return self._receive(120)['text']
+        self.last_stats = []
+        result = self._receive(120)
+        self.last_stats = result.get('stats', [])
+        return result['text']
 
     def close(self):
         if self.process.poll() is None:

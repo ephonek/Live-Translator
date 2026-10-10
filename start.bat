@@ -9,4 +9,10 @@ if not exist ".venv\Scripts\python.exe" (
 
 ".venv\Scripts\python.exe" -X utf8 live_qwen3.py
 
-pause
+set "TRANSLATOR_EXIT=%ERRORLEVEL%"
+if not "%TRANSLATOR_EXIT%"=="0" (
+    echo.
+    echo Translator stopped with an error. Read the message above.
+    pause
+)
+exit /b %TRANSLATOR_EXIT%

@@ -870,6 +870,20 @@ class SubtitleWindow:
                             self.source_status.set('擷取中：' + row['name'])
                         else:
                             self.source_status.set('未收音：' + row['error'])
+                elif row.get('event') == 'pipeline_notice':
+                    self.status.set(row['message'])
+                elif row.get('event') == 'model_released':
+                    self.model_busy = False
+                    if self.model_file is not None:
+                        self.model_button.configure(state='normal')
+                    key = row.get('model')
+                    label = MODELS[key]['label'] if key in MODELS else '未選擇模型'
+                    if key in MODELS:
+                        self.model_choice.set(label)
+                    self.active_model_label = label + '（已卸載）'
+                    self.models_label.set(f'ASR：{self.active_model_label} ｜ 翻譯：{self.translation_model_label}')
+                    self.model_status.set('模型資源已釋放；按繼續後重新載入。')
+                    self.status.set('已暫停 · ASR RAM／顯存已釋放')
                 elif row.get('event') in ('model_loading', 'model_changed'):
                     loading = row['event'] == 'model_loading'
                     self.model_busy = loading
@@ -898,7 +912,7 @@ class SubtitleWindow:
                     self.refresh_history()
                 elif row.get('event') == 'pause_changed':
                     self.paused = row['paused']
-                    self.status.set('已暫停 · 已送出的翻譯仍會完成' if self.paused else '已繼續辨識')
+                    self.status.set('已暫停 · 完成佇列後釋放模型' if self.paused else '正在恢復 · 等待模型就緒')
                 elif row.get('event') == 'language_changed':
                     self.active_language = row['language']
                     if row.get('rejected'):

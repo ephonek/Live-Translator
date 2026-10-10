@@ -40,3 +40,6 @@ config/
 
 # Retry dependency updates after an interrupted update
 .update-dependencies-pending
+
+# Generated session files, test outputs and backups
+runtime/

@@ -17,24 +17,31 @@ def main():
     try:
         from asr_models import MODELS, ASRLengthLimitError
         import numpy as np
-        import torch
         from huggingface_hub.utils import disable_progress_bars
         disable_progress_bars()
-        torch.set_num_threads(min(4, os.cpu_count() or 1))
-        if not torch.cuda.is_available():
-            raise RuntimeError('PyTorch 沒有偵測到 CUDA。')
         key, cache_dir = sys.argv[1:3]
         spec = MODELS[key]
+        synchronize = lambda: None
         if key == 'qwen':
+            import torch
+            torch.set_num_threads(min(4, os.cpu_count() or 1))
+            synchronize = torch.cuda.synchronize
             from qwen_backend import QwenASR
             model = QwenASR()
             recognize = model.transcribe
             backend = 'Transformers FP16'
         else:
             # CUDA 13 / Blackwell use the native PyTorch backend; CT2 requires CUDA 12.
-            use_ct2 = str(torch.version.cuda).startswith('12.') and torch.cuda.get_device_capability()[0] < 10
+            from importlib.util import find_spec
+            # The installed PyTorch supplies DLLs, but CT2 does not need its runtime.
+            torch_spec = find_spec('torch')
+            if torch_spec is None or torch_spec.origin is None:
+                raise RuntimeError('PyTorch CUDA runtime files were not found.')
+            torch_dir = Path(torch_spec.origin).parent
+            lib = torch_dir / 'lib'
+            # CUDA 13 installations use the native Transformers path (RTX 50).
+            use_ct2 = (lib / 'cublas64_12.dll').exists() if os.name == 'nt' else False
             if use_ct2:
-                lib = Path(torch.__file__).parent / 'lib'
                 os.environ['PATH'] = str(lib) + os.pathsep + os.environ.get('PATH', '')
                 dll_handle = os.add_dll_directory(str(lib)) if os.name == 'nt' else None
                 from faster_whisper import WhisperModel
@@ -56,6 +63,11 @@ def main():
                              if w.start < duration and w.end > w.start]
                     return ''.join(words).strip()
             else:
+                import torch
+                torch.set_num_threads(min(4, os.cpu_count() or 1))
+                if not torch.cuda.is_available():
+                    raise RuntimeError('PyTorch 沒有偵測到 CUDA。')
+                synchronize = torch.cuda.synchronize
                 from transformers import AutoProcessor, WhisperForConditionalGeneration
                 processor = AutoProcessor.from_pretrained(spec['hf'])
                 model = WhisperForConditionalGeneration.from_pretrained(
@@ -83,10 +95,10 @@ def main():
                     text = ''
                 else:
                     text = recognize(audio, language)
-                    torch.cuda.synchronize()
-                send(event='result', text=text)
+                    synchronize()
+                send(event='result', text=text, stats=getattr(model, 'last_stats', []) if key == 'qwen' and len(audio) and np.max(np.abs(audio)) >= .0001 else [])
             except ASRLengthLimitError as exc:
-                send(event='length_error', error=str(exc))
+                send(event='length_error', error=str(exc), stats=getattr(model, 'last_stats', []))
     except Exception as exc:
         send(event='error', error=f'{type(exc).__name__}: {exc}')
 

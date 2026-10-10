@@ -12,6 +12,7 @@ TRANSLATION_MODEL = 'gpt-5.4-mini'
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from runtime_paths import runtime_directory
 from dotenv import load_dotenv
 
 load_dotenv(
@@ -23,9 +24,10 @@ import numpy as np
 from asr_models import MODELS, ASRLengthLimitError
 from app_preferences import load_preferences, save_preferences, choice, recommended_model, resolve_source
 from asr_process import ASRProcess
+from audio_jobs import LiveAudioQueue, enqueue_translation
 from audio_source import AudioSource
 from two_pass_translation import translate_windows
-from faster_whisper.vad import get_speech_timestamps
+from light_vad import get_speech_timestamps
 from openai import OpenAI
 from pydantic import BaseModel
 from scipy.signal import resample_poly
@@ -50,7 +52,7 @@ if not os.environ.get("OPENAI_API_KEY"):
     raise SystemExit("找不到 OPENAI_API_KEY。")
 
 ROOT = Path(__file__).resolve().parent
-OUTPUT = ROOT / (
+OUTPUT = runtime_directory('sessions') / (
     datetime.now().strftime("live_qwen3_%Y%m%d_%H%M%S_%f") + ".jsonl"
 )
 
@@ -74,6 +76,7 @@ model_loading = threading.Event()
 model_loading.set()
 model_results = queue.SimpleQueue()
 last_model_request = None
+model_generation = 0
 
 
 class Translation(BaseModel):
@@ -114,7 +117,7 @@ zh_tw：
 """
 
 # 錄音與辨識翻譯各有自己的佇列。
-jobs = queue.Queue(maxsize=8)
+jobs = LiveAudioQueue(maxsize=8)
 translation_jobs = queue.Queue(maxsize=8)
 log_lock = threading.Lock()
 errors = queue.SimpleQueue()
@@ -273,19 +276,24 @@ def translate_worker(log):
 
 def worker():
     asr_call = 0
+    previous_audio_end = None
+    continuity = 0
     model = None
 
-    def change_model(key):
+    def change_model(key, generation):
         nonlocal model
+        if generation != model_generation:
+            return
+        if model is not None and model.key == key:
+            model_results.put((generation, key, model.backend, None, 'ready'))
+            return
         previous = model.key if model is not None else None
         if model is not None:
             model.close()
             model = None
         def load(candidate):
-            publish('model_loading', {'model': candidate,
-                'message': '檢查快取／載入模型；首次使用會下載。此期間不辨識新音訊。'})
             return ASRProcess(candidate, ROOT / 'models',
-                              cancelled=lambda: STOP_FILE.exists() or recording_stopped.is_set())
+                              cancelled=lambda: STOP_FILE.exists() or recording_stopped.is_set() or generation != model_generation)
         error = None
         try:
             model = load(key)
@@ -300,26 +308,43 @@ def worker():
                     return
                 except Exception as recovery:
                     error += f'；恢復舊模型也失敗：{recovery}'
-        model_results.put((model.key if model else None, model.backend if model else '', error))
+        model_results.put((generation, model.key if model else None, model.backend if model else '', error, 'ready'))
 
     try:
         with OUTPUT.open("w", encoding="utf-8") as log, RAW_OUTPUT.open("w", encoding="utf-8") as raw_log:
             translator = threading.Thread(target=translate_worker, args=(log,))
             translator.start()
             try:
-                change_model(active_model)
+                change_model(active_model, 0)
                 while True:
                     job = jobs.get()
                     if job is None:
                         break
-                    if isinstance(job, str):
-                        change_model(job)
+                    if isinstance(job, dict):
+                        if job['generation'] != model_generation:
+                            continue
+                        if job['action'] == 'unload':
+                            if model is not None:
+                                model.close()
+                                model = None
+                            model_results.put((job['generation'], job['model'], '', None, 'released'))
+                        else:
+                            change_model(job['model'], job['generation'])
                         continue
                     if model is None:
                         continue
                     audio, offset, emit_from, emit_to, captured_at, reason, job_language, job_epoch = job
-                    asr_call += 1
                     started = time.perf_counter()
+                    queue_wait = started - captured_at
+                    if queue_wait > 20.0:
+                        publish('pipeline_notice', {'message': '辨識延遲過高，略過等待超過 20 秒的未辨識音訊。',
+                                                    'dropped_start': offset, 'dropped_end': offset + len(audio)/SR})
+                        continue
+                    if previous_audio_end is not None and offset > previous_audio_end + .05:
+                        continuity += 1
+                    previous_audio_end = offset + len(audio) / SR
+                    job_epoch = f'{job_epoch}:{continuity}'
+                    asr_call += 1
                     try:
                         source = model.transcribe(audio, job_language)
                     except ASRLengthLimitError as exc:
@@ -327,12 +352,13 @@ def worker():
                             'asr_call': asr_call, 'language': job_language, 'language_epoch': job_epoch,
                             'start': offset, 'end': offset + len(audio) / SR, 'source': '',
                             'status': 'asr_failed', 'error': str(exc), 'is_final': True,
+                            'asr_model': model.key, 'asr_stats': getattr(model, 'last_stats', []),
                             'asr_seconds': round(time.perf_counter()-started, 3),
                         }
                         write_record(raw_log, rejected)
                         write_record(log, rejected)
                         publish('asr_failed', rejected)
-                        print(f"第 {asr_call} 段辨識失敗（已拆段重試），略過並繼續：{exc}", flush=True)
+                        print(f"第 {asr_call} 段辨識未正常完成，略過並繼續：{exc}", flush=True)
                         continue
                     record = {
                         "asr_call": asr_call,
@@ -340,6 +366,8 @@ def worker():
                         "start": offset, "end": offset + len(audio) / SR,
                         "timestamp_kind": "audio_window", "cut_reason": reason,
                         "asr_model": model.key, "asr_backend": model.backend,
+                        "asr_queue_wait_seconds": round(queue_wait, 3),
+                        "asr_stats": getattr(model, 'last_stats', []),
                         "source": source,
                         "asr_seconds": round(time.perf_counter() - started, 3),
                         "asr_delay_after_capture_seconds": round(time.perf_counter() - captured_at, 3),
@@ -352,16 +380,8 @@ def worker():
                     publish("asr_ready", record)
                     print(f"\n[{record['start']:.2f} → {record['end']:.2f}] "
                           f"編號：{asr_call} / ASR：{source}", flush=True)
-                    try:
-                        if not translator.is_alive():
-                            raise RuntimeError("翻譯工作執行緒已停止。")
-                        translation_jobs.put_nowait((dict(record), captured_at))
-                    except (queue.Full, RuntimeError) as exc:
-                        message = "翻譯積壓超過 8 段，停止擷取。" if isinstance(exc, queue.Full) else str(exc)
-                        rejected = {**record, "error": message}
-                        write_record(log, rejected)
-                        publish("translation_failed", rejected)
-                        raise RuntimeError(message) from exc
+                    enqueue_translation(translation_jobs, (dict(record), captured_at), translator,
+                        lambda: publish('pipeline_notice', {'message': '翻譯忙碌，暫緩辨識以等待消化；已辨識文字會保留。'}))
             except Exception:
                 failed.set()
                 raise
@@ -411,10 +431,10 @@ def submit(reason):
         language_epoch,
     )
 
-    try:
-        jobs.put_nowait(job)
-    except queue.Full:
-        raise RuntimeError("辨識翻譯已積壓 8 段，停止擷取。")
+    dropped = jobs.put_audio(job)
+    if dropped is not None:
+        publish('pipeline_notice', {'message': '辨識跟不上，略過最舊的未辨識音訊以追上直播。',
+                                    'dropped_start': dropped[1], 'dropped_end': dropped[3]})
 
     emit_cursor = boundary
     last_cut = total
@@ -425,9 +445,15 @@ def submit(reason):
 
 
 def check_model_request():
-    global active_model, last_model_request, language_epoch
+    global active_model, last_model_request, language_epoch, model_generation
     while not model_results.empty():
-        key, backend, error = model_results.get()
+        generation, key, backend, error, state = model_results.get()
+        if generation != model_generation:
+            continue
+        if state == 'released':
+            model_loading.clear()
+            publish('model_released', {'model': active_model})
+            continue
         active_model = key
         if key is not None:
             remember_runtime(model=key, language=LANGUAGE)
@@ -454,6 +480,11 @@ def check_model_request():
     if LANGUAGE not in MODELS[key]['languages']:
         publish('model_changed', {'model': active_model, 'error': 'Kotoba 只支援日文，請先切換 JP。'})
         return
+    if capture_paused:
+        active_model = key
+        remember_runtime(model=key, language=LANGUAGE)
+        publish('model_released', {'model': key})
+        return
     if key == active_model:
         publish('model_changed', {'model': active_model, 'backend': '目前已使用此模型'})
         return
@@ -462,7 +493,8 @@ def check_model_request():
     model_loading.set()
     language_epoch += 1
     publish('model_loading', {'model': key, 'message': '完成佇列後切換；此期間不辨識新音訊。'})
-    jobs.put_nowait(key)
+    model_generation += 1
+    jobs.put_nowait({'action': 'load', 'model': key, 'generation': model_generation})
 
 
 def check_language_request():
@@ -491,7 +523,7 @@ def check_language_request():
 
 
 def check_pause_request():
-    global capture_paused, language_epoch
+    global capture_paused, language_epoch, model_generation
     try:
         requested = json.loads(PAUSE_FILE.read_text(encoding='utf-8')).get('paused')
     except (OSError, ValueError, AttributeError):
@@ -501,6 +533,14 @@ def check_pause_request():
     if requested:
         submit('暫停')
     capture_paused = requested
+    model_generation += 1
+    model_switching.set()
+    model_loading.set()
+    key = active_model or choice(preferences, 'model', MODELS, 'turbo')
+    jobs.put_nowait({'action': 'unload' if requested else 'load', 'model': key,
+                     'generation': model_generation})
+    if not requested:
+        publish('model_loading', {'model': key, 'message': '正在重新載入模型；就緒前略過新音訊。'})
     # 中斷前後不可併入同一個翻譯視窗。
     language_epoch += 1
     publish('pause_changed', {'paused': capture_paused})
@@ -566,6 +606,7 @@ def accept_packet(data, captured_at, rate, channels, divisor):
 
 # 字幕視窗只讀本次紀錄；Tk 在獨立程序運作，不阻塞錄音。
 publish("session_started", {"elapsed_seconds": time.monotonic() - SESSION_STARTED, "translation_model": TRANSLATION_MODEL})
+publish('model_loading', {'model': active_model, 'message': '檢查快取／載入模型；首次使用會下載。'})
 LANGUAGE_FILE.write_text(json.dumps({"language": LANGUAGE}), encoding="utf-8")
 PAUSE_FILE.write_text(json.dumps({"paused": False}), encoding="utf-8")
 MODE_FILE.write_text(json.dumps({"mode": translation_mode}), encoding="utf-8")
@@ -698,3 +739,7 @@ finally:
     MODEL_FILE.unlink(missing_ok=True)
 
     cleanup_session_logs()
+
+# Propagate handled failures to the launcher; normal shutdown returns zero.
+if session_error:
+    raise SystemExit(1)
