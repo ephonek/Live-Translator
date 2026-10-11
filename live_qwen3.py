@@ -25,6 +25,8 @@ from asr_models import MODELS, ASRLengthLimitError
 from app_preferences import load_preferences, save_preferences, choice, recommended_model, resolve_source
 from asr_process import ASRProcess
 from audio_jobs import LiveAudioQueue, enqueue_translation
+from audio_context import AudioContext
+from asr_settings import load_settings, validate_settings
 from audio_source import AudioSource
 from two_pass_translation import translate_windows
 from light_vad import get_speech_timestamps
@@ -39,9 +41,9 @@ LANGUAGE = next((a for a in sys.argv[1:] if a in ('ja', 'en')),
 SR = 16000
 KEEP_LOGS = "--keep-logs" in sys.argv
 
-MIN_SECONDS = 2.0
-MAX_SECONDS = 10.0
-PAUSE_SECONDS = 0.6
+asr_settings = load_settings(load_preferences('asr'))
+pending_asr_settings = None
+last_settings_request = None
 VAD_INTERVAL = 0.1
 VAD_WINDOW = 2.0
 
@@ -67,6 +69,7 @@ MODE_FILE = OUTPUT.with_suffix(".mode.json")
 translation_mode = choice(preferences, 'translation_mode', ('paired', 'sliding'), 'sliding')
 SOURCE_FILE = OUTPUT.with_suffix(".source.json")
 MODEL_FILE = OUTPUT.with_suffix(".asr.json")
+SETTINGS_FILE = OUTPUT.with_suffix(".settings.json")
 active_model = choice(preferences, 'model', MODELS, '') or recommended_model()
 if LANGUAGE not in MODELS[active_model]['languages']:
     active_model = 'turbo'
@@ -278,6 +281,7 @@ def worker():
     asr_call = 0
     previous_audio_end = None
     continuity = 0
+    audio_context = AudioContext(SR)
     model = None
 
     def change_model(key, generation):
@@ -323,6 +327,7 @@ def worker():
                     if isinstance(job, dict):
                         if job['generation'] != model_generation:
                             continue
+                        audio_context.clear()
                         if job['action'] == 'unload':
                             if model is not None:
                                 model.close()
@@ -333,10 +338,11 @@ def worker():
                         continue
                     if model is None:
                         continue
-                    audio, offset, emit_from, emit_to, captured_at, reason, job_language, job_epoch = job
+                    audio, offset, emit_from, emit_to, captured_at, reason, job_language, job_epoch, overlap_seconds = job
                     started = time.perf_counter()
                     queue_wait = started - captured_at
                     if queue_wait > 20.0:
+                        audio_context.clear()
                         publish('pipeline_notice', {'message': '辨識延遲過高，略過等待超過 20 秒的未辨識音訊。',
                                                     'dropped_start': offset, 'dropped_end': offset + len(audio)/SR})
                         continue
@@ -344,13 +350,19 @@ def worker():
                         continuity += 1
                     previous_audio_end = offset + len(audio) / SR
                     job_epoch = f'{job_epoch}:{continuity}'
+                    fresh_start, audio_end = offset, offset + len(audio) / SR
+                    audio, offset, actual_overlap = audio_context.prepend(
+                        audio, offset, (job_epoch, job_language, model.key), overlap_seconds)
                     asr_call += 1
                     try:
                         source = model.transcribe(audio, job_language)
                     except ASRLengthLimitError as exc:
+                        audio_context.clear()
+                        continuity += 1
                         rejected = {
                             'asr_call': asr_call, 'language': job_language, 'language_epoch': job_epoch,
-                            'start': offset, 'end': offset + len(audio) / SR, 'source': '',
+                            'start': offset, 'end': audio_end, 'source': '',
+                            'fresh_start': fresh_start, 'audio_overlap_seconds': actual_overlap,
                             'status': 'asr_failed', 'error': str(exc), 'is_final': True,
                             'asr_model': model.key, 'asr_stats': getattr(model, 'last_stats', []),
                             'asr_seconds': round(time.perf_counter()-started, 3),
@@ -363,7 +375,8 @@ def worker():
                     record = {
                         "asr_call": asr_call,
                         "language": job_language, "language_epoch": job_epoch,
-                        "start": offset, "end": offset + len(audio) / SR,
+                        "start": offset, "end": audio_end,
+                        "fresh_start": fresh_start, "audio_overlap_seconds": actual_overlap,
                         "timestamp_kind": "audio_window", "cut_reason": reason,
                         "asr_model": model.key, "asr_backend": model.backend,
                         "asr_queue_wait_seconds": round(queue_wait, 3),
@@ -429,6 +442,7 @@ def submit(reason):
         reason,
         LANGUAGE,
         language_epoch,
+        asr_settings['overlap_seconds'],
     )
 
     dropped = jobs.put_audio(job)
@@ -439,9 +453,46 @@ def submit(reason):
     emit_cursor = boundary
     last_cut = total
 
-    # 沒有詞級時間戳時不做重疊拼接；每個樣本只提交一次。
+    # Queue only fresh samples; the ASR worker prepends context after checking continuity.
     buffer = np.empty(0, dtype=np.float32)
     buffer_start = total
+    apply_pending_asr_settings()
+
+
+def apply_pending_asr_settings():
+    global asr_settings, pending_asr_settings
+    if pending_asr_settings is None:
+        return
+    request_id, asr_settings = pending_asr_settings
+    pending_asr_settings = None
+    publish('asr_settings_changed', {'request_id': request_id, 'settings': asr_settings,
+                                   'message': '已套用，後續新段落使用新設定。'})
+
+
+def check_asr_settings_request():
+    global pending_asr_settings, last_settings_request
+    try:
+        request = json.loads(SETTINGS_FILE.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return
+    if not isinstance(request, dict) or not request.get('request_id'):
+        return
+    request_id = request['request_id']
+    if request_id == last_settings_request:
+        return
+    last_settings_request = request_id
+    try:
+        settings = validate_settings(request.get('settings'))
+        save_preferences('asr', settings)
+    except (ValueError, OSError) as exc:
+        publish('asr_settings_changed', {'request_id': request_id, 'error': str(exc)})
+        return
+    pending_asr_settings = (request_id, settings)
+    if total == emit_cursor:
+        apply_pending_asr_settings()
+    else:
+        publish('asr_settings_pending', {'request_id': request_id,
+                                        'message': '已保存；目前音訊段結束後套用。'})
 
 
 def check_model_request():
@@ -574,7 +625,7 @@ def accept_packet(data, captured_at, rate, channels, divisor):
 
     fresh_seconds = (total - last_cut) / SR
 
-    if fresh_seconds < MIN_SECONDS:
+    if fresh_seconds < asr_settings['min_seconds']:
         return
 
     if total - last_vad < int(VAD_INTERVAL * SR):
@@ -586,7 +637,7 @@ def accept_packet(data, captured_at, rate, channels, divisor):
     speech = get_speech_timestamps(
         recent,
         sampling_rate=SR,
-        threshold=0.4,
+        threshold=asr_settings['vad_threshold'],
         min_speech_duration_ms=0,
         min_silence_duration_ms=100,
         speech_pad_ms=0,
@@ -598,14 +649,15 @@ def accept_packet(data, captured_at, rate, channels, divisor):
         else len(recent) / SR
     )
 
-    if tail_silence >= PAUSE_SECONDS:
+    if tail_silence >= asr_settings['pause_seconds']:
         submit("停頓")
-    elif fresh_seconds >= MAX_SECONDS:
+    elif fresh_seconds >= asr_settings['max_seconds']:
         submit("上限")
 
 
 # 字幕視窗只讀本次紀錄；Tk 在獨立程序運作，不阻塞錄音。
 publish("session_started", {"elapsed_seconds": time.monotonic() - SESSION_STARTED, "translation_model": TRANSLATION_MODEL})
+publish('asr_settings_changed', {'settings': asr_settings})
 publish('model_loading', {'model': active_model, 'message': '檢查快取／載入模型；首次使用會下載。'})
 LANGUAGE_FILE.write_text(json.dumps({"language": LANGUAGE}), encoding="utf-8")
 PAUSE_FILE.write_text(json.dumps({"paused": False}), encoding="utf-8")
@@ -625,6 +677,7 @@ if "--no-window" not in sys.argv:
             [sys.executable, "-X", "utf8", str(ROOT / "subtitle_window.py"),
              "--log", str(EVENT_OUTPUT), "--stop-file", str(STOP_FILE),
              "--title", "直播字幕", "--model-file", str(MODEL_FILE),
+             "--settings-file", str(SETTINGS_FILE),
              "--language-file", str(LANGUAGE_FILE), "--language", LANGUAGE,
              "--pause-file", str(PAUSE_FILE), "--mode-file", str(MODE_FILE), "--source-file", str(SOURCE_FILE)],
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
@@ -658,6 +711,7 @@ try:
     print(f"語言：{LANGUAGE} / 輸出：{OUTPUT}", flush=True)
     print("可在字幕設定中選擇音訊來源，Ctrl+C 停止。", flush=True)
     while not failed.is_set() and not STOP_FILE.exists():
+        check_asr_settings_request()
         check_pause_request()
         check_language_request()
         check_model_request()
@@ -737,6 +791,7 @@ finally:
     MODE_FILE.unlink(missing_ok=True)
     SOURCE_FILE.unlink(missing_ok=True)
     MODEL_FILE.unlink(missing_ok=True)
+    SETTINGS_FILE.unlink(missing_ok=True)
 
     cleanup_session_logs()
 

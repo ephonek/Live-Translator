@@ -1,5 +1,6 @@
 """Local subtitle viewer. It only reads the transcript; closing requests a stop."""
 from asr_models import MODELS
+from asr_settings import FIELDS, DEFAULTS, load_settings, validate_settings
 from app_preferences import load_preferences, save_preferences, choice, bounded, flag
 import argparse
 import json
@@ -184,7 +185,7 @@ class PillButton(tk.Canvas):
 
 
 class SubtitleWindow:
-    def __init__(self, root, log, stop_file, language_file=None, language="ja", pause_file=None, mode_file=None, source_file=None, model_file=None):
+    def __init__(self, root, log, stop_file, language_file=None, language="ja", pause_file=None, mode_file=None, source_file=None, model_file=None, settings_file=None):
         self.root = root
         self.saved_window = load_preferences('window')
         self.saved_runtime = load_preferences('runtime')
@@ -197,6 +198,11 @@ class SubtitleWindow:
         self.active_language = language
         self.pause_file = Path(pause_file) if pause_file else None
         self.source_file = Path(source_file) if source_file else None
+        self.settings_file = Path(settings_file) if settings_file else None
+        saved_asr = load_settings(load_preferences('asr'))
+        self.asr_values = {key: tk.StringVar(value=f'{value:g}') for key, value in saved_asr.items()}
+        self.asr_status = tk.StringVar(value='最短／最長只計算新音訊；重疊為 0 可停用。')
+        self.asr_request_id = None
         self.model_file = Path(model_file) if model_file else None
         self.model_choice = tk.StringVar(value=MODELS[choice(self.saved_runtime, 'model', MODELS, 'qwen')]['label'])
         self.model_status = tk.StringVar(value='正在啟動 ASR…')
@@ -311,7 +317,38 @@ class SubtitleWindow:
 
         self.settings_panel = tk.Frame(root, bg=panel, padx=10, pady=8)
         self.settings_panel.grid(row=3, column=0, sticky='ew', padx=18, pady=5)
-        choices = tk.Frame(self.settings_panel, bg=panel)
+        if self.settings_file is not None:
+            style.configure('ASR.TNotebook', background=panel, borderwidth=0)
+            style.configure('ASR.TNotebook.Tab', background='#263447', foreground='#e8edf5', padding=(14, 5))
+            style.map('ASR.TNotebook.Tab', background=[('selected', '#354b63')])
+            tabs = ttk.Notebook(self.settings_panel, style='ASR.TNotebook')
+            tabs.pack(fill='both', expand=True)
+            general_settings = tk.Frame(tabs, bg=panel, pady=6)
+            audio_settings = tk.Frame(tabs, bg=panel, padx=8, pady=8)
+            tabs.add(general_settings, text='一般')
+            tabs.add(audio_settings, text='語音辨識')
+            self.asr_entries = {}
+            for index, (key, (label, default, low, high, step)) in enumerate(FIELDS.items()):
+                row, col = divmod(index, 2)
+                cell = tk.Frame(audio_settings, bg=panel)
+                cell.grid(row=row, column=col, sticky='w', padx=(0, 20), pady=5)
+                tk.Label(cell, text=label, bg=panel, fg=muted, width=17, anchor='w').pack(side='left')
+                entry = ttk.Spinbox(cell, from_=low, to=high, increment=step,
+                                    textvariable=self.asr_values[key], width=7)
+                entry.pack(side='left')
+                self.asr_entries[key] = entry
+            tk.Label(audio_settings, text='重疊音訊會完整辨識，原文與翻譯可能重複前段內容。\nVAD 門檻越低越敏感；增加音訊長度可能增加推論耗時。',
+                     bg=panel, fg=muted, justify='left', anchor='w').grid(row=3, column=0, columnspan=2, sticky='w', pady=8)
+            actions = tk.Frame(audio_settings, bg=panel)
+            actions.grid(row=4, column=0, columnspan=2, sticky='w')
+            self.asr_apply_button = PillButton(actions, '套用', self.request_asr_settings)
+            self.asr_apply_button.pack(side='left', padx=(0, 8))
+            PillButton(actions, '恢復預設', self.reset_asr_settings).pack(side='left')
+            tk.Label(audio_settings, textvariable=self.asr_status, bg=panel, fg=muted,
+                     wraplength=650, anchor='w', justify='left').grid(row=5, column=0, columnspan=2, sticky='w', pady=(8, 0))
+        else:
+            general_settings = self.settings_panel
+        choices = tk.Frame(general_settings, bg=panel)
         choices.pack(fill='x')
         for label, var, command in [
             ('置頂', self.topmost, lambda: root.attributes('-topmost', self.topmost.get())),
@@ -321,7 +358,7 @@ class SubtitleWindow:
         ]:
             PillButton(choices, label, command, var).pack(side='left', padx=(0, 8))
         tk.Label(choices, textvariable=self.language_status, bg=panel, fg=muted).pack(side='right')
-        appearance = tk.Frame(self.settings_panel, bg=panel)
+        appearance = tk.Frame(general_settings, bg=panel)
         appearance.pack(fill='x', pady=(6, 0))
         PillButton(appearance, 'A−', lambda: self.resize(-2)).pack(side='left')
         self.size_label = tk.StringVar(value=f'{self.size} pt')
@@ -332,14 +369,14 @@ class SubtitleWindow:
                  bg=panel, fg=muted, highlightthickness=0, troughcolor='#34465a',
                  command=lambda v: self.apply_opacity()).pack(side='left')
         if self.mode_file is not None:
-            modes = tk.Frame(self.settings_panel, bg=panel)
+            modes = tk.Frame(general_settings, bg=panel)
             modes.pack(fill='x', pady=(6, 0))
             tk.Label(modes, text='翻譯模式', bg=panel, fg=muted).pack(side='left', padx=(0,8))
             for label, code in [('兩段合併', 'paired'), ('逐段滑動', 'sliding')]:
                 PillButton(modes, label, self.request_mode, self.selected_mode, code).pack(side='left', padx=3)
             tk.Label(modes, textvariable=self.mode_status, bg=panel, fg=muted).pack(side='left', padx=10)
         if self.model_file is not None:
-            models = tk.Frame(self.settings_panel, bg=panel)
+            models = tk.Frame(general_settings, bg=panel)
             models.pack(fill='x', pady=(6, 2))
             tk.Label(models, text='辨識模型', bg=panel, fg=muted).pack(side='left', padx=(0, 8))
             self.model_combo = ttk.Combobox(models, textvariable=self.model_choice, state='readonly',
@@ -348,10 +385,10 @@ class SubtitleWindow:
             self.model_button = PillButton(models, '切換模型', self.request_model)
             self.model_button.pack(side='left', padx=4)
             self.model_button.configure(state='disabled')
-            tk.Label(self.settings_panel, textvariable=self.model_status, bg=panel, fg=muted,
+            tk.Label(general_settings, textvariable=self.model_status, bg=panel, fg=muted,
                      wraplength=620, anchor='w', justify='left').pack(fill='x')
         if self.source_file is not None:
-            sources = tk.Frame(self.settings_panel, bg=panel)
+            sources = tk.Frame(general_settings, bg=panel)
             sources.pack(fill='x', pady=(6, 0))
             tk.Label(sources, text='音訊來源', bg=panel, fg=muted).pack(side='left', padx=(0, 8))
             for label, mode in [('全部輸出', 'device'), ('指定程式', 'process')]:
@@ -366,7 +403,7 @@ class SubtitleWindow:
             self.refresh_button.pack(side='left', padx=3)
             self.source_button = PillButton(sources, '套用', self.request_source)
             self.source_button.pack(side='left', padx=3)
-            tk.Label(self.settings_panel, textvariable=self.source_status, bg=panel, fg=muted,
+            tk.Label(general_settings, textvariable=self.source_status, bg=panel, fg=muted,
                      anchor='w', wraplength=620).pack(fill='x', pady=(4, 0))
             self.update_source_controls()
         self.settings_panel.grid_remove()
@@ -700,6 +737,25 @@ class SubtitleWindow:
         except OSError as exc:
             self.source_status.set(f'音訊來源切換失敗：{exc}')
 
+    def reset_asr_settings(self):
+        for key, value in DEFAULTS.items():
+            self.asr_values[key].set(f'{value:g}')
+        self.asr_status.set('已填入預設值；按「套用」後生效。')
+
+    def request_asr_settings(self):
+        if self.stopped or self.settings_file is None:
+            return
+        try:
+            settings = validate_settings({key: value.get() for key, value in self.asr_values.items()})
+            request_id = str(time.time_ns())
+            temporary = self.settings_file.with_suffix('.tmp')
+            temporary.write_text(json.dumps({'request_id': request_id, 'settings': settings}), encoding='utf-8')
+            temporary.replace(self.settings_file)
+            self.asr_request_id = request_id
+            self.asr_status.set('等待收音程序套用設定…')
+        except (ValueError, OSError) as exc:
+            self.asr_status.set(str(exc))
+
     def request_model(self):
         if self.stopped or self.model_busy or self.model_file is None:
             return
@@ -870,6 +926,9 @@ class SubtitleWindow:
                             self.source_status.set('擷取中：' + row['name'])
                         else:
                             self.source_status.set('未收音：' + row['error'])
+                elif row.get('event') in ('asr_settings_changed', 'asr_settings_pending'):
+                    if self.asr_request_id is None or row.get('request_id') == self.asr_request_id:
+                        self.asr_status.set(row.get('error') or row.get('message') or '目前使用已保存的語音辨識設定。')
                 elif row.get('event') == 'pipeline_notice':
                     self.status.set(row['message'])
                 elif row.get('event') == 'model_released':
@@ -962,10 +1021,11 @@ if __name__ == '__main__':
     parser.add_argument('--mode-file')
     parser.add_argument('--source-file')
     parser.add_argument('--model-file')
+    parser.add_argument('--settings-file')
     parser.add_argument('--language-file')
     parser.add_argument('--language', choices=['en', 'ja'], default='ja')
     args = parser.parse_args()
     root = tk.Tk()
-    app = SubtitleWindow(root, args.log, args.stop_file, args.language_file, args.language, args.pause_file, args.mode_file, args.source_file, args.model_file)
+    app = SubtitleWindow(root, args.log, args.stop_file, args.language_file, args.language, args.pause_file, args.mode_file, args.source_file, args.model_file, args.settings_file)
     root.title(args.title)
     root.mainloop()
