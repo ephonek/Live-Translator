@@ -200,7 +200,9 @@ class SubtitleWindow:
         self.source_file = Path(source_file) if source_file else None
         self.settings_file = Path(settings_file) if settings_file else None
         saved_asr = load_settings(load_preferences('asr'))
-        self.asr_values = {key: tk.StringVar(value=f'{value:g}') for key, value in saved_asr.items()}
+        self.asr_values = {key: tk.StringVar(value=f'{value:g}') for key, value in saved_asr.items() if key in FIELDS}
+        self.qwen_context = tk.BooleanVar(value=saved_asr['qwen_context'])
+        self.qwen_context_button = None
         self.asr_status = tk.StringVar(value='最短／最長只計算新音訊；重疊為 0 可停用。')
         self.asr_request_id = None
         self.model_file = Path(model_file) if model_file else None
@@ -337,7 +339,11 @@ class SubtitleWindow:
                                     textvariable=self.asr_values[key], width=7)
                 entry.pack(side='left')
                 self.asr_entries[key] = entry
-            tk.Label(audio_settings, text='重疊音訊會完整辨識，原文與翻譯可能重複前段內容。\nVAD 門檻越低越敏感；增加音訊長度可能增加推論耗時。',
+            self.qwen_context_button = PillButton(audio_settings, 'Qwen 前文參考（256 tokens）',
+                                                  lambda: None, self.qwen_context)
+            self.qwen_context_button.grid(row=2, column=1, sticky='w', padx=(0, 10))
+            self.qwen_context_button.configure(state='disabled')
+            tk.Label(audio_settings, text='重疊音訊會完整辨識，原文與翻譯可能重複前段內容。\n文字參考僅限 Qwen，其他模型不適用；參考文字仍可能混入輸出。',
                      bg=panel, fg=muted, justify='left', anchor='w').grid(row=3, column=0, columnspan=2, sticky='w', pady=8)
             actions = tk.Frame(audio_settings, bg=panel)
             actions.grid(row=4, column=0, columnspan=2, sticky='w')
@@ -738,7 +744,9 @@ class SubtitleWindow:
             self.source_status.set(f'音訊來源切換失敗：{exc}')
 
     def reset_asr_settings(self):
-        for key, value in DEFAULTS.items():
+        self.qwen_context.set(False)
+        for key in FIELDS:
+            value = DEFAULTS[key]
             self.asr_values[key].set(f'{value:g}')
         self.asr_status.set('已填入預設值；按「套用」後生效。')
 
@@ -746,7 +754,8 @@ class SubtitleWindow:
         if self.stopped or self.settings_file is None:
             return
         try:
-            settings = validate_settings({key: value.get() for key, value in self.asr_values.items()})
+            settings = validate_settings({**{key: value.get() for key, value in self.asr_values.items()},
+                                          'qwen_context': self.qwen_context.get()})
             request_id = str(time.time_ns())
             temporary = self.settings_file.with_suffix('.tmp')
             temporary.write_text(json.dumps({'request_id': request_id, 'settings': settings}), encoding='utf-8')
@@ -941,6 +950,8 @@ class SubtitleWindow:
                         self.model_choice.set(label)
                     self.active_model_label = label + '（已卸載）'
                     self.models_label.set(f'ASR：{self.active_model_label} ｜ 翻譯：{self.translation_model_label}')
+                    if self.qwen_context_button is not None:
+                        self.qwen_context_button.configure(state='normal' if key == 'qwen' else 'disabled')
                     self.model_status.set('模型資源已釋放；按繼續後重新載入。')
                     self.status.set('已暫停 · ASR RAM／顯存已釋放')
                 elif row.get('event') in ('model_loading', 'model_changed'):
@@ -949,6 +960,8 @@ class SubtitleWindow:
                     if self.model_file is not None:
                         self.model_button.configure(state='disabled' if loading else 'normal')
                     key = row.get('model')
+                    if self.qwen_context_button is not None:
+                        self.qwen_context_button.configure(state='normal' if key == 'qwen' and not loading else 'disabled')
                     label = MODELS[key]['label'] if key in MODELS else '未載入模型'
                     self.active_model_label = ('切換中 → ' if loading else '') + label
                     self.models_label.set(f'ASR：{self.active_model_label} ｜ 翻譯：{self.translation_model_label}')

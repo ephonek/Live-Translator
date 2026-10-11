@@ -99,7 +99,10 @@ def main():
                 if not len(audio) or np.max(np.abs(audio)) < .0001:
                     text = ''
                 else:
-                    text = recognize(audio, language)
+                    if key == 'qwen':
+                        text = recognize(audio, language, previous_text=request.get('previous_text'))
+                    else:
+                        text = recognize(audio, language)
                     synchronize()
                 send(event='result', text=text, stats=getattr(model, 'last_stats', []) if key == 'qwen' and len(audio) and np.max(np.abs(audio)) >= .0001 else [])
             except ASRLengthLimitError as exc:

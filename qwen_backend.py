@@ -11,6 +11,7 @@ SEGMENT_BUDGET_SECONDS = 8.0
 
 
 from asr_models import ASRLengthLimitError
+from asr_text_context import make_context_prompt
 
 
 class QwenASR:
@@ -28,9 +29,10 @@ class QwenASR:
             MODEL_ID, dtype=dtype, attn_implementation='sdpa',
         ).to('cuda').eval()
 
-    def transcribe(self, audio, language):
+    def transcribe(self, audio, language, previous_text=None):
         audio = np.asarray(audio, dtype=np.float32)
         self.last_stats = []
+        self._context_prompt, self._context_tokens = make_context_prompt(self.processor.tokenizer, previous_text)
         return self._transcribe_bounded(audio, language, depth=0, deadline=time.monotonic()+SEGMENT_BUDGET_SECONDS)
 
     def _transcribe_bounded(self, audio, language, depth, deadline):
@@ -54,7 +56,7 @@ class QwenASR:
         if not audio.size or np.max(np.abs(audio)) < 0.0001:
             return ''
         inputs = self.processor.apply_transcription_request(
-            audio=audio, language=language,
+            audio=audio, language=language, prompt=self._context_prompt,
         ).to(self.model.device, self.model.dtype)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -69,7 +71,7 @@ class QwenASR:
             eos = self.processor.tokenizer.eos_token_id
         eos = set(eos if isinstance(eos, (list, tuple)) else [eos])
         ended = bool(generated.numel()) and int(generated[0, -1].item()) in eos
-        self.last_stats.append({'audio_seconds': round(len(audio)/16000, 3),
+        self.last_stats.append({'context_tokens': self._context_tokens, 'audio_seconds': round(len(audio)/16000, 3),
                                'generation_seconds': round(time.monotonic()-started, 3),
                                'generated_tokens': int(generated.shape[1]), 'ended': ended,
                                'budget_expired': time.monotonic() >= deadline})

@@ -26,6 +26,7 @@ from app_preferences import load_preferences, save_preferences, choice, recommen
 from asr_process import ASRProcess
 from audio_jobs import LiveAudioQueue, enqueue_translation
 from audio_context import AudioContext
+from asr_text_context import PreviousTranscript
 from asr_settings import load_settings, validate_settings
 from audio_source import AudioSource
 from two_pass_translation import translate_windows
@@ -282,6 +283,7 @@ def worker():
     previous_audio_end = None
     continuity = 0
     audio_context = AudioContext(SR)
+    text_context = PreviousTranscript()
     model = None
 
     def change_model(key, generation):
@@ -328,6 +330,7 @@ def worker():
                         if job['generation'] != model_generation:
                             continue
                         audio_context.clear()
+                        text_context.clear()
                         if job['action'] == 'unload':
                             if model is not None:
                                 model.close()
@@ -338,11 +341,12 @@ def worker():
                         continue
                     if model is None:
                         continue
-                    audio, offset, emit_from, emit_to, captured_at, reason, job_language, job_epoch, overlap_seconds = job
+                    audio, offset, emit_from, emit_to, captured_at, reason, job_language, job_epoch, overlap_seconds, use_text_context = job
                     started = time.perf_counter()
                     queue_wait = started - captured_at
                     if queue_wait > 20.0:
                         audio_context.clear()
+                        text_context.clear()
                         publish('pipeline_notice', {'message': '辨識延遲過高，略過等待超過 20 秒的未辨識音訊。',
                                                     'dropped_start': offset, 'dropped_end': offset + len(audio)/SR})
                         continue
@@ -353,11 +357,18 @@ def worker():
                     fresh_start, audio_end = offset, offset + len(audio) / SR
                     audio, offset, actual_overlap = audio_context.prepend(
                         audio, offset, (job_epoch, job_language, model.key), overlap_seconds)
+                    context_epoch = (job_epoch, job_language, model.key)
+                    context_enabled = use_text_context and model.key == 'qwen'
+                    previous_text = text_context.get(fresh_start, context_epoch, context_enabled)
                     asr_call += 1
                     try:
-                        source = model.transcribe(audio, job_language)
+                        if model.key == 'qwen':
+                            source = model.transcribe(audio, job_language, previous_text=previous_text or None)
+                        else:
+                            source = model.transcribe(audio, job_language)
                     except ASRLengthLimitError as exc:
                         audio_context.clear()
+                        text_context.clear()
                         continuity += 1
                         rejected = {
                             'asr_call': asr_call, 'language': job_language, 'language_epoch': job_epoch,
@@ -372,6 +383,7 @@ def worker():
                         publish('asr_failed', rejected)
                         print(f"第 {asr_call} 段辨識未正常完成，略過並繼續：{exc}", flush=True)
                         continue
+                    text_context.update(source, audio_end, context_epoch, context_enabled)
                     record = {
                         "asr_call": asr_call,
                         "language": job_language, "language_epoch": job_epoch,
@@ -379,6 +391,7 @@ def worker():
                         "fresh_start": fresh_start, "audio_overlap_seconds": actual_overlap,
                         "timestamp_kind": "audio_window", "cut_reason": reason,
                         "asr_model": model.key, "asr_backend": model.backend,
+                        "qwen_context_enabled": context_enabled,
                         "asr_queue_wait_seconds": round(queue_wait, 3),
                         "asr_stats": getattr(model, 'last_stats', []),
                         "source": source,
@@ -443,6 +456,7 @@ def submit(reason):
         LANGUAGE,
         language_epoch,
         asr_settings['overlap_seconds'],
+        asr_settings['qwen_context'],
     )
 
     dropped = jobs.put_audio(job)

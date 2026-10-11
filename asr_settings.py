@@ -9,12 +9,16 @@ FIELDS = {
     'vad_threshold': ('VAD 人聲門檻', 0.4, 0.1, 0.9, 0.05),
 }
 DEFAULTS = {key: spec[1] for key, spec in FIELDS.items()}
+DEFAULTS['qwen_context'] = False
 
 
 def validate_settings(values):
     if not isinstance(values, dict):
         raise ValueError('設定格式不正確。')
-    result = {}
+    context = values.get('qwen_context', False)
+    if type(context) is not bool:
+        raise ValueError('Qwen 前文參考必須為開或關。')
+    result = {'qwen_context': context}
     for key, (label, default, low, high, _) in FIELDS.items():
         raw = values.get(key, default)
         try:

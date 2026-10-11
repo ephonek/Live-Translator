@@ -67,8 +67,10 @@ class ASRProcess:
             return message
         raise TimeoutError('ASR 等待逾時；請檢查網路、模型快取或 GPU。')
 
-    def transcribe(self, audio, language):
+    def transcribe(self, audio, language, previous_text=None):
         payload = {'language': language, 'audio': base64.b64encode(audio.astype('<f4', copy=False).tobytes()).decode('ascii')}
+        if self.key == 'qwen' and previous_text:
+            payload['previous_text'] = previous_text
         self.process.stdin.write(json.dumps(payload) + '\n')
         self.process.stdin.flush()
         self.last_stats = []
