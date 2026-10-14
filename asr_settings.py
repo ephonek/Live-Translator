@@ -10,6 +10,7 @@ FIELDS = {
 }
 DEFAULTS = {key: spec[1] for key, spec in FIELDS.items()}
 DEFAULTS['qwen_context'] = False
+DEFAULTS['whisper_vad'] = False
 
 
 def validate_settings(values):
@@ -18,7 +19,10 @@ def validate_settings(values):
     context = values.get('qwen_context', False)
     if type(context) is not bool:
         raise ValueError('Qwen 前文參考必須為開或關。')
-    result = {'qwen_context': context}
+    vad = values.get('whisper_vad', False)
+    if type(vad) is not bool:
+        raise ValueError('Whisper 內建 VAD 必須為開或關。')
+    result = {'qwen_context': context, 'whisper_vad': vad}
     for key, (label, default, low, high, _) in FIELDS.items():
         raw = values.get(key, default)
         try:

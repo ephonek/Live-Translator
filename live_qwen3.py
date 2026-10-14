@@ -341,7 +341,7 @@ def worker():
                         continue
                     if model is None:
                         continue
-                    audio, offset, emit_from, emit_to, captured_at, reason, job_language, job_epoch, overlap_seconds, use_text_context = job
+                    audio, offset, emit_from, emit_to, captured_at, reason, job_language, job_epoch, overlap_seconds, use_text_context, whisper_vad = job
                     started = time.perf_counter()
                     queue_wait = started - captured_at
                     if queue_wait > 20.0:
@@ -365,7 +365,7 @@ def worker():
                         if model.key == 'qwen':
                             source = model.transcribe(audio, job_language, previous_text=previous_text or None)
                         else:
-                            source = model.transcribe(audio, job_language)
+                            source = model.transcribe(audio, job_language, whisper_vad=whisper_vad)
                     except ASRLengthLimitError as exc:
                         audio_context.clear()
                         text_context.clear()
@@ -392,6 +392,7 @@ def worker():
                         "timestamp_kind": "audio_window", "cut_reason": reason,
                         "asr_model": model.key, "asr_backend": model.backend,
                         "qwen_context_enabled": context_enabled,
+                        "whisper_vad_enabled": whisper_vad and model.backend.startswith("faster-whisper"),
                         "asr_queue_wait_seconds": round(queue_wait, 3),
                         "asr_stats": getattr(model, 'last_stats', []),
                         "source": source,
@@ -457,6 +458,7 @@ def submit(reason):
         language_epoch,
         asr_settings['overlap_seconds'],
         asr_settings['qwen_context'],
+        asr_settings['whisper_vad'],
     )
 
     dropped = jobs.put_audio(job)

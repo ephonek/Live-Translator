@@ -53,12 +53,12 @@ def main():
                                      download_root=cache_dir, cpu_threads=4, num_workers=1)
                 backend = 'faster-whisper ' + ('INT8/FP16' if compute_type == 'int8_float16' else 'INT8/FP32')
 
-                def recognize(audio, language):
+                def recognize(audio, language, whisper_vad=False):
                     segments, _ = model.transcribe(audio, language=language, task='transcribe',
                         beam_size=5, temperature=0.0, condition_on_previous_text=False,
                         # Kotoba's CT2 config carries large-v3 alignment heads that
                         # exceed its two decoder layers. Do not run word alignment.
-                        vad_filter=False, word_timestamps=(key != 'kotoba'), max_new_tokens=256)
+                        vad_filter=whisper_vad, word_timestamps=(key != 'kotoba'), max_new_tokens=256)
                     # Alignment bounds keep padded end-of-window text out of subtitles.
                     duration = len(audio) / 16000
                     if key == 'kotoba':
@@ -79,7 +79,7 @@ def main():
                     spec['hf'], dtype=torch.float16, attn_implementation='sdpa').to('cuda').eval()
                 backend = 'Transformers FP16'
 
-                def recognize(audio, language):
+                def recognize(audio, language, whisper_vad=False):
                     inputs = processor(audio, sampling_rate=16000, return_tensors='pt',
                                        return_attention_mask=True).to('cuda', torch.float16)
                     with torch.inference_mode():
@@ -102,7 +102,7 @@ def main():
                     if key == 'qwen':
                         text = recognize(audio, language, previous_text=request.get('previous_text'))
                     else:
-                        text = recognize(audio, language)
+                        text = recognize(audio, language, whisper_vad=request.get('whisper_vad') is True)
                     synchronize()
                 send(event='result', text=text, stats=getattr(model, 'last_stats', []) if key == 'qwen' and len(audio) and np.max(np.abs(audio)) >= .0001 else [])
             except ASRLengthLimitError as exc:

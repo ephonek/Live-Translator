@@ -203,6 +203,8 @@ class SubtitleWindow:
         self.asr_values = {key: tk.StringVar(value=f'{value:g}') for key, value in saved_asr.items() if key in FIELDS}
         self.qwen_context = tk.BooleanVar(value=saved_asr['qwen_context'])
         self.qwen_context_button = None
+        self.whisper_vad = tk.BooleanVar(value=saved_asr['whisper_vad'])
+        self.whisper_vad_button = None
         self.asr_status = tk.StringVar(value='最短／最長只計算新音訊；重疊為 0 可停用。')
         self.asr_request_id = None
         self.model_file = Path(model_file) if model_file else None
@@ -343,15 +345,19 @@ class SubtitleWindow:
                                                   lambda: None, self.qwen_context)
             self.qwen_context_button.grid(row=2, column=1, sticky='w', padx=(0, 10))
             self.qwen_context_button.configure(state='disabled')
-            tk.Label(audio_settings, text='重疊音訊會完整辨識，原文與翻譯可能重複前段內容。\n文字參考僅限 Qwen，其他模型不適用；參考文字仍可能混入輸出。',
-                     bg=panel, fg=muted, justify='left', anchor='w').grid(row=3, column=0, columnspan=2, sticky='w', pady=8)
+            self.whisper_vad_button = PillButton(audio_settings, 'Whisper 內建 VAD',
+                                                  lambda: None, self.whisper_vad)
+            self.whisper_vad_button.grid(row=3, column=0, columnspan=2, sticky='w', pady=5)
+            self.whisper_vad_button.configure(state='disabled')
+            tk.Label(audio_settings, text='重疊音訊會完整辨識，原文與翻譯可能重複前段內容。\n文字參考僅限 Qwen，其他模型不適用；參考文字仍可能混入輸出。\n內建 VAD 僅限 faster-whisper（turbo／Kotoba）；RTX 50 後端不適用。',
+                     bg=panel, fg=muted, justify='left', anchor='w').grid(row=4, column=0, columnspan=2, sticky='w', pady=8)
             actions = tk.Frame(audio_settings, bg=panel)
-            actions.grid(row=4, column=0, columnspan=2, sticky='w')
+            actions.grid(row=5, column=0, columnspan=2, sticky='w')
             self.asr_apply_button = PillButton(actions, '套用', self.request_asr_settings)
             self.asr_apply_button.pack(side='left', padx=(0, 8))
             PillButton(actions, '恢復預設', self.reset_asr_settings).pack(side='left')
             tk.Label(audio_settings, textvariable=self.asr_status, bg=panel, fg=muted,
-                     wraplength=650, anchor='w', justify='left').grid(row=5, column=0, columnspan=2, sticky='w', pady=(8, 0))
+                     wraplength=650, anchor='w', justify='left').grid(row=6, column=0, columnspan=2, sticky='w', pady=(8, 0))
         else:
             general_settings = self.settings_panel
         choices = tk.Frame(general_settings, bg=panel)
@@ -745,6 +751,7 @@ class SubtitleWindow:
 
     def reset_asr_settings(self):
         self.qwen_context.set(False)
+        self.whisper_vad.set(False)
         for key in FIELDS:
             value = DEFAULTS[key]
             self.asr_values[key].set(f'{value:g}')
@@ -755,7 +762,8 @@ class SubtitleWindow:
             return
         try:
             settings = validate_settings({**{key: value.get() for key, value in self.asr_values.items()},
-                                          'qwen_context': self.qwen_context.get()})
+                                          'qwen_context': self.qwen_context.get(),
+                                          'whisper_vad': self.whisper_vad.get()})
             request_id = str(time.time_ns())
             temporary = self.settings_file.with_suffix('.tmp')
             temporary.write_text(json.dumps({'request_id': request_id, 'settings': settings}), encoding='utf-8')
@@ -956,6 +964,9 @@ class SubtitleWindow:
                     self.status.set('已暫停 · ASR RAM／顯存已釋放')
                 elif row.get('event') in ('model_loading', 'model_changed'):
                     loading = row['event'] == 'model_loading'
+                    if self.whisper_vad_button is not None:
+                        supported = not loading and str(row.get('backend', '')).startswith('faster-whisper')
+                        self.whisper_vad_button.configure(state='normal' if supported else 'disabled')
                     self.model_busy = loading
                     if self.model_file is not None:
                         self.model_button.configure(state='disabled' if loading else 'normal')
